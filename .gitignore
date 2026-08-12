@@ -1,0 +1,23 @@
+# scratch / research clones, never part of the feed
+.tmp/
+/tmp/
+
+# build outputs
+sdk/
+dl/
+bin/
+build_dir/
+staging_dir/
+feeds/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

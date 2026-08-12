@@ -1,0 +1,11 @@
+--- a/setup.py	2026-08-04 00:57:23.000000000 +0800
++++ b/setup.py	2026-08-13 03:50:28.024340500 +0800
+@@ -29,7 +29,7 @@
+ from setuptools import setup
+ from setuptools.command.sdist import sdist
+ 
+-_IN_NIX_BUILD = os.environ.get("HERMES_NIX_BUILD") == "1"
++_IN_NIX_BUILD = True  # OpenWrt: python3-package.mk builds wheels via `python3 -m build --no-isolation`
+ 
+ _BLOCK_MESSAGE = (
+     "Building wheels or sdists for hermes-agent is not supported.\n"

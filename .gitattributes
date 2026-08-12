@@ -1,0 +1,3 @@
+# Force LF everywhere: CRLF breaks make(1) parsing of Makefiles and
+# rpcd's ucode loader, and CI checks out on Linux.
+* text=auto eol=lf

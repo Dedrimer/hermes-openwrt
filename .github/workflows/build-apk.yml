@@ -1,0 +1,88 @@
+# Build the hermes-openwrt feed against the OpenWrt 25.12 SDK and produce
+# .apk packages (apk-tools 2.x, the default package manager since 25.x).
+# Run on push/PR and manually via workflow_dispatch.
+#
+# The SDK resolves the newest 25.12.x patch release automatically.
+
+name: build-apk (OpenWrt 25.12)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  build:
+    name: 25.12 ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86-64
+            target: x86
+            subtarget: '64'
+          - name: mediatek-filogic
+            target: mediatek
+            subtarget: filogic
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential clang flex bison gawk g++ gcc-multilib \
+            gettext git libncurses-dev libssl-dev python3 python3-setuptools \
+            rsync unzip zlib1g-dev file
+
+      - name: Resolve SDK URL
+        id: sdk
+        run: |
+          ver="$(curl -fsSL https://downloads.openwrt.org/releases/ | grep -oE '25\.12\.[0-9]+' | sort -V | tail -n1)"
+          test -n "${ver}"
+          base="https://downloads.openwrt.org/releases/${ver}/targets/${{ matrix.target }}/${{ matrix.subtarget }}"
+          url="$(curl -fsSL "${base}/" | grep -oE 'openwrt-sdk-[^"<]*\.tar\.xz' | head -n1 | sed "s|^|${base}/|")"
+          test -n "${url}"
+          echo "SDK release: ${ver}"
+          echo "SDK URL: ${url}"
+          echo "url=${url}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download and extract SDK
+        run: |
+          mkdir -p sdk
+          curl -fsSL "${{ steps.sdk.outputs.url }}" -o sdk.tar.xz
+          tar -xJf sdk.tar.xz --strip-components=1 -C sdk
+          rm -f sdk.tar.xz
+
+      - name: Setup feeds
+        working-directory: sdk
+        run: |
+          ./scripts/feeds update packages luci
+          ./scripts/feeds src-link hermes-openwrt "${GITHUB_WORKSPACE}/packages"
+          ./scripts/feeds install -a
+          make defconfig
+
+      - name: Build hermes-agent and LuCI app
+        working-directory: sdk
+        run: |
+          make package/hermes-agent/compile V=s
+          make package/luci-app-hermes-agent/compile V=s
+
+      - name: List build products
+        run: |
+          find sdk/bin -type f \( -name '*.ipk' -o -name '*.apk' \) -printf '%s %p\n' | sort -k2
+          test "$(find sdk/bin -name 'hermes-agent_*.apk' | wc -l)" -gt 0
+          test "$(find sdk/bin -name 'luci-app-hermes-agent_*.apk' | wc -l)" -gt 0
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-25.12-${{ matrix.name }}
+          path: sdk/bin/
+          retention-days: 7
+          if-no-files-found: error

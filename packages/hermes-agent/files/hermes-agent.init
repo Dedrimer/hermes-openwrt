@@ -1,0 +1,61 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=10
+
+USE_PROCD=1
+PROG=/usr/bin/hermes
+
+HERMES_HOME=/etc/hermes
+
+# Instance-aware start: /etc/init.d/hermes-agent start [gateway|dashboard]
+# With no instance argument every enabled instance is (re)started.
+start_service() {
+	local inst="${1:-}"
+	local enabled profile bind port insecure
+
+	config_load hermes-agent
+
+	# gateway instance
+	config_get_bool enabled gateway enabled 0
+	config_get profile gateway profile default
+
+	if [ -z "$inst" ] || [ "$inst" = "gateway" ]; then
+		if [ "$enabled" = "1" ]; then
+			procd_open_instance gateway
+			procd_set_param command "$PROG" gateway run --replace --external-supervisor
+			procd_set_param env HERMES_HOME="$HERMES_HOME"
+			[ -n "$profile" ] && [ "$profile" != "default" ] && \
+				procd_set_param env HERMES_PROFILE="$profile"
+			procd_set_param respawn 3600 5 5
+			procd_set_param file /etc/config/hermes-agent
+			procd_close_instance
+		fi
+	fi
+
+	# dashboard instance (headless `hermes serve`)
+	config_get_bool enabled dashboard enabled 0
+	config_get bind dashboard bind 127.0.0.1
+	config_get port dashboard port 9119
+	config_get_bool insecure dashboard insecure 0
+
+	if [ -z "$inst" ] || [ "$inst" = "dashboard" ]; then
+		if [ "$enabled" = "1" ]; then
+			local serve_cmd="$PROG serve --host $bind --port $port --no-open"
+			[ "$insecure" = "1" ] && serve_cmd="$serve_cmd --insecure"
+			procd_open_instance dashboard
+			procd_set_param command $serve_cmd
+			procd_set_param env HERMES_HOME="$HERMES_HOME"
+			procd_set_param respawn 3600 5 5
+			procd_set_param file /etc/config/hermes-agent
+			procd_close_instance
+		fi
+	fi
+}
+
+reload_service() {
+	local inst="${1:-}"
+
+	stop "$inst"
+	start "$inst"
+}

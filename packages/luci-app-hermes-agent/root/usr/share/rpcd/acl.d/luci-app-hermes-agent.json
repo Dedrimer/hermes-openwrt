@@ -1,0 +1,17 @@
+{
+	"luci-app-hermes-agent": {
+		"description": "Grant access to Hermes Agent status, settings and logs",
+		"read": {
+			"ubus": {
+				"hermes-agent": [ "status", "logs", "settings_get" ]
+			},
+			"uci": [ "hermes-agent" ]
+		},
+		"write": {
+			"ubus": {
+				"hermes-agent": [ "action", "settings_set" ]
+			},
+			"uci": [ "hermes-agent" ]
+		}
+	}
+}
