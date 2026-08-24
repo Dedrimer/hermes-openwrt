@@ -1,0 +1,227 @@
+# Build the hermes-openwrt feed against the four SDK/architecture combinations
+# this port targets, and verify the resulting packages.
+#
+#   OpenWrt 25.12  x86/64          -> .apk   (apk-tools v3)
+#   OpenWrt 25.12  rockchip/armv8  -> .apk
+#   OpenWrt 24.10  x86/64          -> .ipk   (opkg)
+#   OpenWrt 24.10  rockchip/armv8  -> .ipk
+#
+# Both releases are resolved to their newest patch version at run time, so the
+# build tracks upstream fixes without a commit here. The two releases also pin
+# two different CPython minor versions (3.11 on 24.10, 3.13 on 25.12), which is
+# the point of covering both: the dependency wheels are prebuilt musllinux
+# binaries selected by ABI tag, so a release bump that moves Python is exactly
+# the kind of breakage this matrix is here to catch.
+#
+# The two x86_64 legs additionally run the packages: scripts/smoke/run.sh
+# installs them into that release's own rootfs and executes them. The aarch64
+# legs cannot -- the sandbox runs the target's real binaries on the runner --
+# so they stop at package inspection.
+
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+# A newer push makes an in-flight run irrelevant; SDK builds are not cheap.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Fast gate. Everything here runs in seconds and catches the failure mode that
+  # is otherwise only visible on a real router: a syntax error in a LuCI view, a
+  # menu entry pointing at a view that does not exist, or an ubus method a view
+  # calls but the ACL does not grant.
+  lint:
+    name: static checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ucode
+        run: |
+          sudo apt-get update -qq
+          # Not in every Ubuntu image; check-sources.sh falls back to node when
+          # it is absent, so this is best-effort.
+          sudo apt-get install -y -qq ucode || echo "ucode unavailable, will use the node fallback"
+
+      - name: Run static checks
+        run: sh scripts/check-sources.sh
+
+      # deps/*.mk and deps.lock.json are generated from upstream's uv.lock at the
+      # exact commit the Makefile pins. Re-resolving from that commit must
+      # reproduce them byte for byte; if it does not, someone hand-edited a
+      # generated file and the next upgrade would silently revert it.
+      - name: Verify the dependency lock matches the pinned upstream commit
+        run: |
+          set -eu
+          ref="$(sed -n 's/^PKG_SOURCE_VERSION:=\(.*\)$/\1/p' packages/hermes-agent/Makefile)"
+          test -n "${ref}"
+          echo "pinned upstream commit: ${ref}"
+          python3 scripts/sync-deps.py --ref "${ref}" --check
+
+  build:
+    name: ${{ matrix.release }} ${{ matrix.name }} (${{ matrix.fmt }})
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - release: '25.12'
+            name: x86-64
+            target: x86
+            subtarget: '64'
+            fmt: apk
+          - release: '25.12'
+            name: rockchip-armv8
+            target: rockchip
+            subtarget: armv8
+            fmt: apk
+          - release: '24.10'
+            name: x86-64
+            target: x86
+            subtarget: '64'
+            fmt: ipk
+          - release: '24.10'
+            name: rockchip-armv8
+            target: rockchip
+            subtarget: armv8
+            fmt: ipk
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential clang flex bison gawk g++ gcc-multilib \
+            gettext git libncurses-dev libssl-dev python3 python3-setuptools \
+            rsync unzip zlib1g-dev file zstd \
+            swig python3-pyelftools
+          # swig and pyelftools are not ours: `make` runs the prereq phase for
+          # every package the SDK has selected, and uboot-rockchip's prereq
+          # demands them. The trim step below deselects u-boot anyway, but a
+          # matrix leg should not fail over a host package this cheap to add.
+
+      - name: Resolve SDK URL
+        id: sdk
+        run: |
+          set -eu
+          ver="$(curl -fsSL https://downloads.openwrt.org/releases/ \
+            | grep -oE '${{ matrix.release }}\.[0-9]+' | sort -V | tail -n1)"
+          test -n "${ver}"
+          base="https://downloads.openwrt.org/releases/${ver}/targets/${{ matrix.target }}/${{ matrix.subtarget }}"
+          url="$(curl -fsSL "${base}/" | grep -oE 'openwrt-sdk-[^"<]*\.tar\.(xz|zst)' | head -n1 | sed "s|^|${base}/|")"
+          test -n "${url}"
+          echo "SDK release: ${ver}"
+          echo "SDK URL: ${url}"
+          echo "version=${ver}" >> "${GITHUB_OUTPUT}"
+          echo "url=${url}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download and extract SDK
+        run: |
+          set -eu
+          mkdir -p sdk
+          url='${{ steps.sdk.outputs.url }}'
+          curl -fsSL "${url}" -o "sdk.tar.${url##*.}"
+          # 24.10 ships .tar.xz, 25.12 switched to .tar.zst.
+          case "${url}" in
+            *.zst) tar --zstd -xf sdk.tar.zst --strip-components=1 -C sdk ;;
+            *)     tar -xJf sdk.tar.xz --strip-components=1 -C sdk ;;
+          esac
+          rm -f sdk.tar.*
+
+      - name: Setup feeds and select only this feed's packages
+        working-directory: sdk
+        run: |
+          set -eu
+          ./scripts/feeds update -a
+          ./scripts/feeds src-link hermes-openwrt "${GITHUB_WORKSPACE}/packages" 2>/dev/null || \
+            echo "src-link hermes-openwrt ${GITHUB_WORKSPACE}/packages" >> feeds.conf
+          ./scripts/feeds update hermes-openwrt
+          ./scripts/feeds install -a
+
+          # An SDK arrives with all 6683 packages of every feed selected: 1084
+          # kernel modules, 188 firmware blobs and (on rockchip) 35 u-boot
+          # variants. Building one feed package then compiles that universe as
+          # collateral, and `make` runs every selected package's prereq first.
+          #
+          # This cannot be fixed from .config alone -- the generated
+          # Config-build.in declares those symbols without a prompt, so kconfig
+          # ignores user values and defconfig reverts them -- nor from
+          # Config-build.in alone, because feed packages are declared a second
+          # time *with* a prompt in tmp/.config-package.in and keep their =m
+          # from the shipped .config. The script does both, runs defconfig, and
+          # asserts the result (64 packages, 0 kmods). See the comment in it for
+          # why a partial kmod selection is worse than no trim at all.
+          sh "${GITHUB_WORKSPACE}/scripts/sdk-trim-config.sh" .
+
+          echo "selected: $(grep -c '^CONFIG_PACKAGE_.*=[ym]' .config) packages, $(grep -c '^CONFIG_PACKAGE_kmod.*=[ym]' .config) kmods"
+          grep -E '^CONFIG_PACKAGE_(hermes-agent|luci-app-hermes-agent)=' .config
+          grep -hE '^CONFIG_(ARCH|TARGET_ARCH_PACKAGES)=' .config
+
+      - name: Build hermes-agent
+        working-directory: sdk
+        run: make package/hermes-agent/compile V=s -j"$(nproc)"
+
+      - name: Build luci-app-hermes-agent
+        working-directory: sdk
+        run: make package/luci-app-hermes-agent/compile V=s -j"$(nproc)"
+
+      # The same script a human runs after a local build: unpack both packages
+      # and assert the files the Makefiles promise are actually in them. A
+      # missing $(INSTALL_BIN) line does not fail a build, it ships a package
+      # that installs cleanly and does nothing.
+      - name: Verify package contents
+        run: sh scripts/check-artifacts.sh sdk
+
+      # One layer further: install the packages into this release's own rootfs
+      # and run them. This is the only layer that executes target code, so it is
+      # the only one that can catch a wheel whose ABI does not match, a missing
+      # stdlib module, an rpcd plugin that registers but throws on first use, or
+      # a websocket handshake that never completes. `rand()` -- not a ucode
+      # builtin, so it compiled and passed every static check, then failed the
+      # first time a user pressed Send -- is the bug that earned this step.
+      #
+      # x86_64 only, by nature: the sandbox executes the target's own binaries.
+      # run.sh exits non-zero with the count of failed checks.
+      - name: Runtime smoke test
+        if: matrix.target == 'x86'
+        run: |
+          set -eu
+          sudo apt-get install -y -qq bubblewrap
+          # Ubuntu 24.04 confines unprivileged user namespaces with AppArmor,
+          # which is precisely what bwrap needs; without this the sandbox fails
+          # to start. The runner is disposable and we have root on it, so lift
+          # the restriction rather than installing a profile for one binary.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          # ~250 MB rootfs download, deliberately not cached: it is a fraction of
+          # the SDK this job already fetched, and a stale cache here would be a
+          # verification harness lying about which rootfs it tested.
+          sh scripts/smoke/run.sh sdk "${RUNNER_TEMP}/smoke"
+
+      - name: Collect packages
+        if: always()
+        run: |
+          mkdir -p artifacts
+          find sdk/bin -type f \( -name 'hermes-agent[-_][0-9]*' -o -name 'luci-app-hermes-agent[-_][0-9]*' \) \
+            -exec cp -v {} artifacts/ \; || true
+          ls -la artifacts/ || true
+
+      - name: Upload packages
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-${{ matrix.fmt }}-${{ matrix.release }}-${{ matrix.name }}
+          path: artifacts/
+          retention-days: 14
+          if-no-files-found: error

@@ -1,38 +1,95 @@
 // Copyright (C) 2026 hermes-openwrt feed contributors
 // Licensed to the public under the Apache License 2.0.
 //
-// rpcd ucode plugin exposing the "hermes-agent" ubus object used by the
-// LuCI views. Loaded by rpcd from /usr/share/rpcd/ucode/; the ubus object
-// name is taken from the object returned at the end of this file.
+// rpcd ucode plugin backing the LuCI views. The ubus object name is the key of
+// the table returned at the end of this file, i.e. "luci.hermes-agent"; every
+// method is gated by the ACL groups in acl.d/luci-app-hermes-agent.json.
 //
-// Security notes:
-//  - all shell invocations go through shellquote() to prevent injection
-//  - settings_set only accepts a fixed whitelist of environment keys
-//  - config.yaml writes are capped at 64 KiB and keep a .bak copy
-//  - ubus ACLs (see acl.d/luci-app-hermes-agent.json) gate every method
+// Design rules, because this runs as root on someone's router:
+//   * Secrets are write-only. settings_get reports whether a provider key is
+//     set, never its value, so an API key is never echoed back into a browser
+//     tab, a proxy log, or a screenshot.
+//   * .env is edited through a fixed key whitelist; lines the whitelist does
+//     not know about are preserved byte for byte.
+//   * Every shell argument goes through shellquote().
+//   * config.yaml writes are size-capped and keep a .bak.
+//
+// Note on iteration style: ucode's `for (let x in array)` yields VALUES, not
+// indices, which is the opposite of JavaScript and an easy way to write a
+// silently broken whitelist check. Explicit index loops below sidestep the
+// question entirely.
 
 'use strict';
 
-import { popen, readfile, writefile, access } from 'fs';
+import { popen, readfile, writefile, access, stat, open, mkdir, rename, unlink } from 'fs';
 import { connect } from 'ubus';
 import { cursor } from 'uci';
 
-const ENV_FILE = '/etc/hermes/.env';
-const CONFIG_FILE = '/etc/hermes/config.yaml';
+const HERMES_HOME = '/srv/hermes';
+const ENV_FILE = HERMES_HOME + '/.env';
+const CONFIG_FILE = HERMES_HOME + '/config.yaml';
+const CONFIG_MAX = 65536;
 
-// Environment keys managed through the LuCI settings view. All other
-// variables in .env are preserved untouched by settings_set.
+// Chat bridge IPC. hermes-chatd owns the websocket; these files are the whole
+// interface between it and the browser. See /usr/sbin/hermes-chatd for why the
+// chat page cannot simply hold a connection open through uhttpd.
+const CHAT_DIR = '/var/run/hermes-chat';
+const CHAT_EVENTS = CHAT_DIR + '/events';
+const CHAT_STATE = CHAT_DIR + '/state';
+const CHAT_REQ_DIR = CHAT_DIR + '/req';
+
+// One poll never returns more than this. A long agent turn can emit hundreds of
+// KiB of deltas while the browser tab is hidden (LuCI's poll loop pauses then),
+// and a single 1 MiB ubus reply would be refused by ubus' message size limit
+// long before it reached the page. The reply carries the new offset, so the page
+// simply polls again and catches up over a few ticks.
+const CHAT_CHUNK_MAX = 131072;
+const CHAT_REQ_MAX = 131072;
+
+// Serial number for queue filenames. See chat_send for why this is not rand().
+let chatSeq = 0;
+
+// Gateway methods the chat page may invoke. Narrower than hermes-chatd's own
+// allowlist on purpose -- this is what the UI actually uses.
+const CHAT_METHODS = [
+	'approval.pending',
+	'approval.respond',
+	'clarify.respond',
+	'model.options',
+	'prompt.submit',
+	'session.close',
+	'session.create',
+	'session.history',
+	'session.interrupt',
+	'session.status',
+	'session.title'
+];
+
+// Provider credentials editable from the Settings page. Anything else already
+// in .env is left untouched.
 const ENV_KEYS = [
 	'OPENAI_API_KEY',
 	'ANTHROPIC_API_KEY',
 	'OPENROUTER_API_KEY',
 	'NOUS_API_KEY',
+	'DEEPSEEK_API_KEY',
 	'GEMINI_API_KEY',
-	'HF_TOKEN'
+	'OPENAI_BASE_URL'
 ];
 
+// OPENAI_BASE_URL is a URL, not a credential, so the UI may show it.
+const ENV_PUBLIC = [ 'OPENAI_BASE_URL' ];
+
+function has(arr, needle) {
+	for (let i = 0; i < length(arr); i++)
+		if (arr[i] == needle)
+			return true;
+
+	return false;
+}
+
 function shellquote(s) {
-	return `'${replace(s, "'", "'\\''")}'`;
+	return `'${replace(`${s}`, "'", "'\\''")}'`;
 }
 
 function exec(cmd) {
@@ -41,76 +98,182 @@ function exec(cmd) {
 	if (!fd)
 		return { code: -1, output: '' };
 
-	let output = fd.read('all');
+	let output = fd.read('all') ?? '';
 	let code = fd.close();
 
 	return { code: code, output: output };
 }
 
+// Parse .env into { KEY: value } for whitelisted keys only.
 function readEnv() {
-	let env = {};
-
-	for (let key in ENV_KEYS)
-		env[ENV_KEYS[key]] = null;
-
+	let out = {};
 	let data = readfile(ENV_FILE);
 
-	if (data) {
-		for (let line in split(data, '\n')) {
-			let m = match(line, /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+	if (!data)
+		return out;
 
-			if (m && contains(ENV_KEYS, m[1]))
-				env[m[1]] = m[2];
-		}
+	let lines = split(data, '\n');
+
+	for (let i = 0; i < length(lines); i++) {
+		let m = match(lines[i], /^[ \t]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+
+		if (m && has(ENV_KEYS, m[1]))
+			out[m[1]] = m[2];
 	}
 
-	return env;
+	return out;
 }
 
-function writeEnv(env) {
+// Rewrite .env applying `sets` (key -> value) and `clears` (list of keys).
+// Untouched lines, including comments and keys outside the whitelist, survive
+// in their original order and spelling.
+function writeEnv(sets, clears) {
+	let seen = {};
 	let kept = [];
-	let found = {};
-	let data = readfile(ENV_FILE);
+	let data = readfile(ENV_FILE) ?? '';
+	let lines = split(data, '\n');
 
-	if (data) {
-		for (let line in split(data, '\n')) {
-			let m = match(line, /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+	for (let i = 0; i < length(lines); i++) {
+		let line = lines[i];
+		let m = match(line, /^[ \t]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+		let key = (m && has(ENV_KEYS, m[1])) ? m[1] : null;
 
-			if (m && contains(ENV_KEYS, m[1])) {
-				found[m[1]] = true;
+		if (key == null) {
+			// Drop only the trailing empty line the final \n produces.
+			if (i < length(lines) - 1 || line != '')
+				push(kept, line);
 
-				if (env[m[1]] != null && env[m[1]] != '')
-					kept.push(m[1] + '=' + env[m[1]]);
-			}
-			else if (line != '') {
-				kept.push(line);
-			}
+			continue;
 		}
+
+		seen[key] = true;
+
+		if (has(clears, key))
+			continue;
+
+		push(kept, exists(sets, key) ? `${key}=${sets[key]}` : line);
 	}
 
-	for (let key in ENV_KEYS) {
-		let name = ENV_KEYS[key];
+	// Keys that were not present in the file yet.
+	for (let i = 0; i < length(ENV_KEYS); i++) {
+		let key = ENV_KEYS[i];
 
-		if (!found[name] && env[name] != null && env[name] != '')
-			kept.push(name + '=' + env[name]);
+		if (!seen[key] && exists(sets, key))
+			push(kept, `${key}=${sets[key]}`);
 	}
 
-	return writefile(ENV_FILE, join(kept, '\n') + '\n');
+	if (!writefile(ENV_FILE, join(kept, '\n') + '\n'))
+		return false;
+
+	// writefile() creates with the umask; secrets must not be group/world
+	// readable even for the one tick before postinst-style fixups.
+	exec('chmod 0600 ' + shellquote(ENV_FILE));
+
+	return true;
+}
+
+function uciServe() {
+	let c = cursor();
+
+	return {
+		enabled: c.get('hermes-agent', 'serve', 'enabled') ?? '0',
+		host: c.get('hermes-agent', 'serve', 'host') ?? '127.0.0.1',
+		port: c.get('hermes-agent', 'serve', 'port') ?? '9119',
+		log_level: c.get('hermes-agent', 'serve', 'log_level') ?? 'info',
+		workdir: c.get('hermes-agent', 'serve', 'workdir') ?? HERMES_HOME + '/workspace'
+	};
+}
+
+// --- chat bridge helpers ---------------------------------------------------
+
+function chatState() {
+	let raw = readfile(CHAT_STATE);
+
+	if (!raw)
+		return null;
+
+	// A half-written state file cannot happen -- hermes-chatd writes a temp file
+	// and renames -- but a truncated read should degrade to "bridge down" rather
+	// than throwing out of the ubus call.
+	try {
+		let st = json(raw);
+
+		return (type(st) == 'object') ? st : null;
+	} catch (e) {
+		return null;
+	}
+}
+
+// Read the event log from `start` onwards, returning whole lines only.
+//
+// seek() is used to avoid pulling the entire log through on every 1s poll, but
+// its result is verified with tell() and falls back to substr(): this plugin
+// cannot be exercised on a build host (there is no target ucode there), so the
+// cheap path is treated as an optimisation rather than a requirement. Both
+// branches produce identical bytes.
+function chatRead(start) {
+	let fd = open(CHAT_EVENTS, 'r');
+
+	if (!fd)
+		return { offset: start, lines: [] };
+
+	let seeked = false;
+
+	if (start > 0) {
+		fd.seek(start);
+		seeked = (fd.tell() == start);
+	}
+
+	let data = fd.read('all') ?? '';
+	fd.close();
+
+	if (start > 0 && !seeked)
+		data = substr(data, start) ?? '';
+
+	if (length(data) > CHAT_CHUNK_MAX)
+		data = substr(data, 0, CHAT_CHUNK_MAX);
+
+	// Never hand a partial JSON line to the page: cut back to the last newline
+	// and leave the remainder for the next poll. hermes-chatd appends whole
+	// lines, but a poll can still land between the write of a large delta and
+	// its terminating newline, and the CHAT_CHUNK_MAX cut above lands mid-line
+	// by definition.
+	let cut = rindex(data, '\n');
+
+	if (cut == null || cut < 0)
+		return { offset: start, lines: [] };
+
+	let body = substr(data, 0, cut);
+
+	return {
+		offset: start + cut + 1,
+		lines: filter(split(body, '\n'), l => l != '')
+	};
 }
 
 const methods = {
+	// Everything the Overview page needs, in one round trip.
 	status: {
-		call: function(request) {
+		call: function() {
+			let serve = uciServe();
 			let out = {
-				version: readfile('/etc/hermes/.version') || '',
-				home: '/etc/hermes',
+				version: '',
+				home: HERMES_HOME,
+				config_present: !!access(CONFIG_FILE),
+				env_present: !!access(ENV_FILE),
+				running: false,
+				pid: 0,
 				disk: null,
-				instances: {},
-				config: null
+				serve: serve,
+				listen: `${serve.host}:${serve.port}`
 			};
 
-			// Disk usage of HERMES_HOME (last line: the matching mount)
-			let df = exec('df -k /etc/hermes | tail -n 1');
+			let v = exec('/usr/bin/hermes --version');
+
+			if (v.code == 0)
+				out.version = trim(v.output);
+
+			let df = exec('df -k ' + shellquote(HERMES_HOME) + ' | tail -n 1');
 			let parts = split(trim(df.output), /[ \t]+/);
 
 			if (df.code == 0 && length(parts) >= 5)
@@ -121,119 +284,306 @@ const methods = {
 					capacity: parts[length(parts) - 2]
 				};
 
-			// Runtime state of the hermes-agent service instances
-			let ubus = connect();
+			let bus = connect();
 
-			if (ubus) {
-				let svc = ubus.call('service', 'list', { name: 'hermes-agent', verbose: true });
+			if (bus) {
+				let svc = bus.call('service', 'list', { name: 'hermes-agent', verbose: true });
+				let inst = svc?.['hermes-agent']?.instances?.serve;
 
-				if (svc && svc['hermes-agent'])
-					out.instances = svc['hermes-agent'].instances || {};
+				if (inst) {
+					out.running = (inst.running == true);
+					out.pid = inst.pid ?? 0;
+				}
 			}
 
-			// UCI configuration
-			let c = cursor();
+			// Bridge health, for free: the Overview page is where someone looks
+			// when the Chat page says nothing is happening, and this comes out of
+			// a file we would otherwise make them open a second view to see.
+			let chat = chatState();
 
-			out.config = {
-				gateway: {
-					enabled: c.get('hermes-agent', 'gateway', 'enabled') || '0',
-					profile: c.get('hermes-agent', 'gateway', 'profile') || 'default'
-				},
-				dashboard: {
-					enabled: c.get('hermes-agent', 'dashboard', 'enabled') || '0',
-					bind: c.get('hermes-agent', 'dashboard', 'bind') || '127.0.0.1',
-					port: c.get('hermes-agent', 'dashboard', 'port') || '9119',
-					insecure: c.get('hermes-agent', 'dashboard', 'insecure') || '0'
-				}
+			out.bridge = {
+				running: (chat != null),
+				connected: (chat != null && chat.connected == true),
+				error: chat?.error ?? ''
 			};
 
 			return out;
 		}
 	},
 
+	// Service control. `enable`/`disable` flip the UCI flag and then converge
+	// the running state, so the button the user pressed is also the state they
+	// get without a second trip.
 	action: {
+		args: { op: '' },
 		call: function(request) {
-			let op = request.args ? request.args.op : null;
+			let op = request.args?.op;
 
-			if (op != 'start' && op != 'stop' && op != 'restart')
-				return { code: -1, output: 'Invalid operation: ' + op };
+			if (op == 'enable' || op == 'disable') {
+				let c = cursor();
+
+				c.set('hermes-agent', 'serve', 'enabled', (op == 'enable') ? '1' : '0');
+				c.commit('hermes-agent');
+
+				return exec('/etc/init.d/hermes-agent ' + ((op == 'enable') ? 'restart' : 'stop'));
+			}
+
+			if (op != 'start' && op != 'stop' && op != 'restart' && op != 'reload')
+				return { code: -1, output: 'invalid operation: ' + op };
 
 			return exec('/etc/init.d/hermes-agent ' + op);
 		}
 	},
 
 	logs: {
+		args: { lines: 0, pattern: '' },
 		call: function(request) {
-			let a = request.args || {};
+			let a = request.args ?? {};
 			let lines = 200;
 			let pattern = 'hermes';
 
-			if (typeof(a.lines) == 'integer' && a.lines > 0 && a.lines <= 1000)
+			if (type(a.lines) == 'int' && a.lines > 0 && a.lines <= 1000)
 				lines = a.lines;
 
-			if (typeof(a.pattern) == 'string' && a.pattern != '')
+			if (type(a.pattern) == 'string' && a.pattern != '' && length(a.pattern) <= 200)
 				pattern = a.pattern;
-
-			if (length(pattern) > 200)
-				return { code: -1, lines: [] };
 
 			let r = exec('logread -l ' + lines + ' -e ' + shellquote(pattern));
 
 			if (r.code != 0)
 				return { code: r.code, lines: [] };
 
-			return { code: 0, lines: filter(split(trim(r.output), '\n'), s => s != '') };
+			return { code: 0, lines: filter(split(trim(r.output), '\n'), l => l != '') };
 		}
 	},
 
+	// Secrets are reported as presence flags. `env` carries only the values in
+	// ENV_PUBLIC; `env_set` tells the UI which keys already hold something.
 	settings_get: {
 		call: function() {
+			let env = readEnv();
+			let present = {};
+			let visible = {};
+
+			for (let i = 0; i < length(ENV_KEYS); i++) {
+				let key = ENV_KEYS[i];
+
+				present[key] = (env[key] != null && env[key] != '');
+
+				if (has(ENV_PUBLIC, key))
+					visible[key] = env[key] ?? '';
+			}
+
+			let st = stat(CONFIG_FILE);
+
 			return {
-				env: readEnv(),
-				config: readfile(CONFIG_FILE) || ''
+				env_present: present,
+				env: visible,
+				config: readfile(CONFIG_FILE) ?? '',
+				config_size: st?.size ?? 0,
+				keys: ENV_KEYS
 			};
 		}
 	},
 
 	settings_set: {
+		args: { env_set: {}, env_clear: [], config: '' },
 		call: function(request) {
-			let a = request.args || {};
+			let a = request.args ?? {};
 
-			if (a.config != null) {
-				if (typeof(a.config) != 'string' || length(a.config) > 65536)
-					return { ok: false, error: 'config must be a string <= 64 KiB' };
+			if (a.config != null && a.config != '') {
+				if (type(a.config) != 'string')
+					return { ok: false, error: 'config must be a string' };
 
-				// Keep a backup of the previous configuration
+				if (length(a.config) > CONFIG_MAX)
+					return { ok: false, error: `config exceeds ${CONFIG_MAX} bytes` };
+
 				if (access(CONFIG_FILE))
 					exec('cp ' + shellquote(CONFIG_FILE) + ' ' + shellquote(CONFIG_FILE + '.bak'));
 
 				if (!writefile(CONFIG_FILE, a.config))
-					return { ok: false, error: 'Failed to write ' + CONFIG_FILE };
+					return { ok: false, error: 'failed to write ' + CONFIG_FILE };
+
+				exec('chmod 0640 ' + shellquote(CONFIG_FILE));
 			}
 
-			if (a.env != null) {
-				if (typeof(a.env) != 'object')
-					return { ok: false, error: 'env must be an object' };
+			let sets = {};
+			let clears = [];
+			let dirty = false;
 
-				let env = {};
+			if (a.env_set != null) {
+				if (type(a.env_set) != 'object')
+					return { ok: false, error: 'env_set must be an object' };
 
-				for (let key in ENV_KEYS) {
-					let name = ENV_KEYS[key];
-					let value = a.env[name];
+				for (let key in a.env_set) {
+					if (!has(ENV_KEYS, key))
+						return { ok: false, error: 'key not editable: ' + key };
 
-					if (value != null && typeof(value) != 'string')
-						return { ok: false, error: 'Invalid value for ' + name };
+					let v = a.env_set[key];
 
-					env[name] = value;
+					if (type(v) != 'string')
+						return { ok: false, error: 'value for ' + key + ' must be a string' };
+
+					// A newline would smuggle a second assignment into .env.
+					if (match(v, /[\r\n]/))
+						return { ok: false, error: 'value for ' + key + ' contains a newline' };
+
+					sets[key] = v;
+					dirty = true;
 				}
-
-				if (!writeEnv(env))
-					return { ok: false, error: 'Failed to write ' + ENV_FILE };
 			}
+
+			if (a.env_clear != null) {
+				if (type(a.env_clear) != 'array')
+					return { ok: false, error: 'env_clear must be an array' };
+
+				for (let i = 0; i < length(a.env_clear); i++) {
+					let key = a.env_clear[i];
+
+					if (!has(ENV_KEYS, key))
+						return { ok: false, error: 'key not editable: ' + key };
+
+					push(clears, key);
+					dirty = true;
+				}
+			}
+
+			if (dirty && !writeEnv(sets, clears))
+				return { ok: false, error: 'failed to write ' + ENV_FILE };
 
 			return { ok: true };
+		}
+	},
+
+	// --- chat bridge -------------------------------------------------------
+	//
+	// The chat page is not allowed to name an arbitrary gateway method: the same
+	// JSON-RPC socket also carries shell.exec, cli.exec and process.kill.
+	// hermes-chatd enforces its own allowlist as the authoritative check (it is
+	// the only thing holding the socket); repeating a narrower one here means a
+	// bad request is refused before it is ever written to disk, and the caller
+	// gets a synchronous error instead of a silent drop.
+	chat_send: {
+		args: { id: '', method: '', params: {} },
+		call: function(request) {
+			let a = request.args ?? {};
+			let id = a.id;
+			let method = a.method;
+			let params = a.params ?? {};
+
+			if (type(id) != 'string' || !match(id, /^[A-Za-z0-9_.:-]{1,64}$/))
+				return { ok: false, error: 'invalid request id' };
+
+			if (type(method) != 'string' || !has(CHAT_METHODS, method))
+				return { ok: false, error: 'method not permitted: ' + method };
+
+			if (type(params) != 'object')
+				return { ok: false, error: 'params must be an object' };
+
+			let payload = sprintf('%J', { jsonrpc: '2.0', id: id, method: method, params: params });
+
+			if (length(payload) > CHAT_REQ_MAX)
+				return { ok: false, error: `request exceeds ${CHAT_REQ_MAX} bytes` };
+
+			let st = chatState();
+
+			if (!st)
+				return { ok: false, error: 'the chat bridge is not running (start hermes-chatd)' };
+
+			if (st.connected != true)
+				return { ok: false, error: st.error ?? 'the chat bridge is not connected to the gateway' };
+
+			// Land the file atomically. The daemon scans this directory every
+			// 200ms and skips dot-prefixed names, so a half-written request is
+			// never picked up.
+			mkdir(CHAT_REQ_DIR, 0o700);
+
+			// The name only has to be unique, not unpredictable -- the directory
+			// is 0700 and nothing but root reads it. rand() is deliberately not
+			// used: it is not a ucode builtin at all (it lives in the optional
+			// ucode-mod-math package), so it compiles cleanly and then throws
+			// "access to undeclared variable rand" the first time anyone sends a
+			// chat message. `id` is already validated against
+			// [A-Za-z0-9_.:-]{1,64}, so it is safe as a path component, and the
+			// counter separates two requests that reuse one id within a second.
+			let base = sprintf('%010d-%03x-%s', time(), (chatSeq++) % 4096, id);
+			let tmp = CHAT_REQ_DIR + '/.' + base;
+			let final = CHAT_REQ_DIR + '/' + base;
+
+			if (!writefile(tmp, payload))
+				return { ok: false, error: 'failed to queue the request' };
+
+			if (!rename(tmp, final)) {
+				unlink(tmp);
+
+				return { ok: false, error: 'failed to queue the request' };
+			}
+
+			return { ok: true, id: id };
+		}
+	},
+
+	// Incremental read of the event log.
+	//
+	// The caller keeps two numbers: `gen` and `offset`. Passing them back gets
+	// whatever arrived since. A `gen` that no longer matches means the log was
+	// rotated or the daemon restarted, so events were lost -- the reply then sets
+	// resync and the page reloads the transcript with session.history rather than
+	// rendering a transcript with a hole in it.
+	//
+	// `tail` starts a fresh reader at the end of the log. Without it a newly
+	// opened page would replay every event since the daemon started, including
+	// other sessions' turns, only to throw them away after session.history.
+	chat_poll: {
+		args: { gen: 0, offset: 0, tail: true },
+		call: function(request) {
+			let a = request.args ?? {};
+			let st = chatState();
+
+			if (!st)
+				return {
+					gen: 0, offset: 0, lines: [], resync: true, running: false,
+					connected: false,
+					error: 'the chat bridge is not running (start hermes-chatd)'
+				};
+
+			// The real file size, not state.size: state is only rewritten when
+			// the link state changes, so its size field lags behind appends.
+			let size = stat(CHAT_EVENTS)?.size ?? 0;
+			let gen = st.gen ?? 0;
+			let want = (type(a.gen) == 'int') ? a.gen : 0;
+			let start = (type(a.offset) == 'int' && a.offset > 0) ? a.offset : 0;
+			let resync = false;
+
+			if (a.tail == true) {
+				start = size;
+				resync = true;
+			} else if (want != gen) {
+				start = 0;
+				resync = true;
+			} else if (start > size) {
+				// A shrunken log means a rotation we have not been told about.
+				start = 0;
+				resync = true;
+			}
+
+			let chunk = (a.tail == true)
+				? { offset: start, lines: [] }
+				: chatRead(start);
+
+			return {
+				gen: gen,
+				offset: chunk.offset,
+				lines: chunk.lines,
+				resync: resync,
+				running: true,
+				connected: (st.connected == true),
+				error: st.error ?? '',
+				active_session: st.active_session ?? '',
+				gateway: st.gateway ?? ''
+			};
 		}
 	}
 };
 
-return { 'hermes-agent': methods };
+return { 'luci.hermes-agent': methods };

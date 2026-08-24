@@ -1,0 +1,765 @@
+#!/usr/bin/python3
+"""hermes-chatd -- WebSocket bridge between the LuCI chat page and the Hermes gateway.
+
+WHY THIS PROCESS EXISTS
+=======================
+Hermes' chat protocol is WebSocket-only: `/api/ws` carries newline-delimited
+JSON-RPC, and there is no HTTP polling equivalent (see the route table in
+hermes_cli/web_server.py -- every chat surface is a @app.websocket). A browser
+page cannot reach it directly either, because the gateway binds loopback and
+LuCI must not proxy an unauthenticated agent socket to the LAN.
+
+The obvious answer -- a streaming CGI script -- does not work on OpenWrt.
+uhttpd arms `script_timeout` (default 60s) *once*, when it forks the CGI
+process, and never rearms it:
+
+    proc.c, uh_create_process():
+        if (conf.script_timeout > 0)
+                uloop_timeout_set(&proc->timeout, conf.script_timeout * 1000);
+    proc.c, proc_timeout_cb():
+        uh_relay_kill(cl, &proc->r);   /* SIGKILL */
+
+So any CGI is hard-killed after 60 seconds no matter how much it writes;
+SSE heartbeats do not help. On top of that /etc/config/uhttpd ships
+`max_requests 3`, so a held-open request starves LuCI's own ubus calls.
+
+Hence: one small resident process owns the WebSocket, and the LuCI page talks
+to it through the rpcd ucode plugin (luci.hermes-agent chat_send / chat_poll).
+That reuses LuCI's session auth and ACL, needs no new HTTP surface, and every
+individual call finishes in about a millisecond.
+
+IPC IS FILES, DELIBERATELY
+==========================
+  /var/run/hermes-chat/events   append-only, newline-delimited: a verbatim
+                                transcript of the gateway's downstream frames,
+                                plus synthetic `bridge.*` events from here.
+                                Readers use a byte offset as their cursor.
+  /var/run/hermes-chat/state    small JSON: generation, link state, the
+                                session the page should reattach to.
+  /var/run/hermes-chat/req/     request spool. One JSON object per file; this
+                                process reads, unlinks and forwards them.
+
+Files rather than a socket because the reader is a ucode script inside rpcd:
+reading a byte range of a file needs nothing beyond ucode-mod-fs, which rpcd
+already depends on, whereas a socket would add ucode-mod-socket and put
+blocking I/O inside the process that serves all of LuCI. The cost is a 200 ms
+spool scan, which on tmpfs is a single readdir.
+
+Everything here is Python standard library, including the RFC 6455 client.
+Hermes' own `websockets` package is available in its private site-packages, but
+importing it would tie this bridge to that package's version and to Hermes'
+PYTHONPATH; framing a text frame is thirty lines.
+"""
+
+import argparse
+import base64
+import errno
+import json
+import os
+import re
+import select
+import signal
+import socket
+import struct
+import sys
+import time
+
+# ---------------------------------------------------------------------------
+# Policy
+# ---------------------------------------------------------------------------
+
+# Only these JSON-RPC methods may cross the bridge. The spool directory is
+# root-only and rpcd already gates callers on the LuCI write ACL, so this is
+# defence in depth -- but the gateway also exposes shell.exec, cli.exec and
+# process.kill on the same socket, and a chat page has no business reaching
+# them. Keep this list to what the chat view actually calls.
+ALLOWED_METHODS = frozenset({
+    'approval.pending',
+    'approval.respond',
+    'clarify.respond',
+    'model.options',
+    'prompt.submit',
+    'session.close',
+    'session.create',
+    'session.history',
+    'session.interrupt',
+    'session.list',
+    'session.status',
+    'session.title',
+    'session.usage',
+})
+
+# Rotate rather than grow without bound: this lives in tmpfs. A rotation bumps
+# the generation, which tells readers "you may have missed something, re-sync
+# with session.history" instead of silently skipping events.
+EVENTS_MAX_BYTES = 1 << 20
+
+SPOOL_SCAN_INTERVAL = 0.2
+RECONNECT_MIN = 1.0
+RECONNECT_MAX = 30.0
+REQUEST_MAX_BYTES = 256 * 1024
+
+_ID_RE = re.compile(r'^[A-Za-z0-9_.:-]{1,64}$')
+
+
+def log(msg):
+    sys.stderr.write('hermes-chatd: %s\n' % msg)
+    sys.stderr.flush()
+
+
+# ---------------------------------------------------------------------------
+# Minimal RFC 6455 client
+# ---------------------------------------------------------------------------
+
+OP_CONT, OP_TEXT, OP_BIN, OP_CLOSE, OP_PING, OP_PONG = 0x0, 0x1, 0x2, 0x8, 0x9, 0xA
+
+
+class WsError(Exception):
+    pass
+
+
+def ws_encode(payload, opcode=OP_TEXT):
+    """Build a masked client frame. Clients MUST mask (RFC 6455 5.3)."""
+    n = len(payload)
+
+    if n < 126:
+        head = struct.pack('!BB', 0x80 | opcode, 0x80 | n)
+    elif n < 65536:
+        head = struct.pack('!BBH', 0x80 | opcode, 0x80 | 126, n)
+    else:
+        head = struct.pack('!BBQ', 0x80 | opcode, 0x80 | 127, n)
+
+    mask = os.urandom(4)
+    body = bytearray(payload)
+
+    for i in range(n):
+        body[i] ^= mask[i & 3]
+
+    return head + mask + bytes(body)
+
+
+class WsParser:
+    """Incremental frame parser. feed() returns complete (opcode, payload) messages.
+
+    Fragmentation is reassembled here so callers only ever see whole messages;
+    the gateway does not fragment today, but a proxy in between might.
+    """
+
+    def __init__(self):
+        self.buf = bytearray()
+        self._frag_op = None
+        self._frag = bytearray()
+
+    def feed(self, data):
+        self.buf += data
+        out = []
+
+        while True:
+            r = self._one()
+
+            if r is None:
+                break
+
+            if r is False:
+                continue
+
+            out.append(r)
+
+        return out
+
+    def _one(self):
+        b = self.buf
+
+        if len(b) < 2:
+            return None
+
+        fin = bool(b[0] & 0x80)
+        op = b[0] & 0x0F
+        masked = bool(b[1] & 0x80)
+        ln = b[1] & 0x7F
+        p = 2
+
+        if ln == 126:
+            if len(b) < 4:
+                return None
+
+            ln = struct.unpack_from('!H', b, 2)[0]
+            p = 4
+        elif ln == 127:
+            if len(b) < 10:
+                return None
+
+            ln = struct.unpack_from('!Q', b, 2)[0]
+            p = 10
+
+        if masked:
+            if len(b) < p + 4:
+                return None
+
+            mask = bytes(b[p:p + 4])
+            p += 4
+        else:
+            mask = None
+
+        if len(b) < p + ln:
+            return None
+
+        payload = bytearray(b[p:p + ln])
+        del b[:p + ln]
+
+        if mask:
+            for i in range(ln):
+                payload[i] ^= mask[i & 3]
+
+        # Control frames are never fragmented and never interleave with a
+        # fragmented data message.
+        if op in (OP_CLOSE, OP_PING, OP_PONG):
+            return (op, bytes(payload))
+
+        if op == OP_CONT:
+            if self._frag_op is None:
+                raise WsError('continuation frame with nothing to continue')
+
+            self._frag += payload
+
+            if not fin:
+                return False
+
+            msg = (self._frag_op, bytes(self._frag))
+            self._frag_op = None
+            self._frag = bytearray()
+
+            return msg
+
+        if not fin:
+            self._frag_op = op
+            self._frag = payload
+
+            return False
+
+        return (op, bytes(payload))
+
+
+def _host_header(host, port):
+    # _is_accepted_host() in web_server.py strips the port and handles IPv6
+    # brackets, so this only has to be well-formed.
+    return '[%s]:%d' % (host, port) if ':' in host else '%s:%d' % (host, port)
+
+
+def ws_open(host, port, token, timeout=10.0):
+    """Open /api/ws and return (socket, leftover_bytes).
+
+    Three gates in web_server.py have to be satisfied, all without patching
+    Hermes:
+
+      _ws_auth_reason      -- even a loopback bind demands a credential:
+                              an empty ?token= is rejected outright, and the
+                              value is compared to the process' session token
+                              with hmac.compare_digest. _resolve_session_token()
+                              reads HERMES_DASHBOARD_SESSION_TOKEN first, so
+                              hermes-wrapper exports the token this file reads.
+      _ws_host_origin_reason -- returns None immediately when Origin is absent,
+                              so a non-browser client simply omits it. Host
+                              still has to name a loopback address.
+      _ws_client_reason    -- the peer address must be loopback, and an unknown
+                              peer fails closed. Connecting to 127.0.0.1 from
+                              the same box satisfies it.
+    """
+    s = socket.create_connection((host, port), timeout=timeout)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    key = base64.b64encode(os.urandom(16)).decode('ascii')
+    req = (
+        'GET /api/ws?token=%s HTTP/1.1\r\n'
+        'Host: %s\r\n'
+        'Upgrade: websocket\r\n'
+        'Connection: Upgrade\r\n'
+        'Sec-WebSocket-Key: %s\r\n'
+        'Sec-WebSocket-Version: 13\r\n'
+        'User-Agent: hermes-chatd\r\n'
+        '\r\n'
+    ) % (token, _host_header(host, port), key)
+
+    s.sendall(req.encode('ascii'))
+
+    buf = b''
+
+    while b'\r\n\r\n' not in buf:
+        chunk = s.recv(4096)
+
+        if not chunk:
+            s.close()
+            raise WsError('gateway closed the connection during the handshake')
+
+        buf += chunk
+
+        if len(buf) > 65536:
+            s.close()
+            raise WsError('handshake response too large')
+
+    head, _, rest = buf.partition(b'\r\n\r\n')
+    status = head.split(b'\r\n', 1)[0].decode('latin-1', 'replace')
+
+    if ' 101' not in status:
+        s.close()
+        # A 403 here is almost always a token mismatch: the gateway was started
+        # without HERMES_DASHBOARD_SESSION_TOKEN and minted its own.
+        raise WsError('handshake rejected: %s' % status)
+
+    s.settimeout(None)
+    s.setblocking(False)
+
+    return s, rest
+
+
+# ---------------------------------------------------------------------------
+# Bridge
+# ---------------------------------------------------------------------------
+
+class Bridge:
+    def __init__(self, args):
+        self.host = args.host
+        self.port = args.port
+        self.token_file = args.token_file
+        self.run_dir = args.run_dir
+        self.events_path = os.path.join(self.run_dir, 'events')
+        self.state_path = os.path.join(self.run_dir, 'state')
+        self.req_dir = os.path.join(self.run_dir, 'req')
+
+        self.sock = None
+        self.parser = None
+        self.rx = bytearray()          # partial downstream JSON line
+        self.tx = bytearray()          # pending bytes for the WS socket
+        self.next_retry = 0.0
+        self.backoff = RECONNECT_MIN
+        self.last_scan = 0.0
+        self.running = True
+
+        self.gen = int(time.time())    # changes on every rotation
+        self.connected = False
+        self.error = ''
+        self.active_session = ''
+        self.pending = {}              # rpc id -> method, for result bookkeeping
+
+        self.events_fd = None
+        self.events_size = 0
+
+    # -- filesystem plumbing ------------------------------------------------
+
+    def setup(self):
+        os.makedirs(self.run_dir, mode=0o700, exist_ok=True)
+        os.chmod(self.run_dir, 0o700)
+        os.makedirs(self.req_dir, mode=0o700, exist_ok=True)
+        os.chmod(self.req_dir, 0o700)
+
+        # Anything left from a previous run refers to sessions that may no
+        # longer exist and to a generation nobody is tracking.
+        for name in os.listdir(self.req_dir):
+            try:
+                os.unlink(os.path.join(self.req_dir, name))
+            except OSError:
+                pass
+
+        self.events_fd = os.open(self.events_path,
+                                 os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.ftruncate(self.events_fd, 0)
+        self.events_size = 0
+        self.write_state()
+
+    def write_state(self):
+        state = {
+            'gen': self.gen,
+            'connected': self.connected,
+            'error': self.error,
+            'active_session': self.active_session,
+            'gateway': '%s:%d' % (self.host, self.port),
+            'size': self.events_size,
+            'pid': os.getpid(),
+            'updated': int(time.time()),
+        }
+        tmp = self.state_path + '.tmp'
+
+        with open(tmp, 'w') as f:
+            json.dump(state, f)
+
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, self.state_path)
+
+    def emit_line(self, line):
+        """Append one already-serialised JSON line to the event log."""
+        data = line.encode('utf-8', 'replace') if isinstance(line, str) else line
+
+        if not data.endswith(b'\n'):
+            data += b'\n'
+
+        if self.events_size + len(data) > EVENTS_MAX_BYTES:
+            # O_APPEND after ftruncate resumes at offset 0, which is exactly
+            # what a new generation means.
+            os.ftruncate(self.events_fd, 0)
+            self.events_size = 0
+            self.gen += 1
+            log('event log rotated, generation %d' % self.gen)
+
+        os.write(self.events_fd, data)
+        self.events_size += len(data)
+
+    def emit_event(self, etype, payload=None, session_id=''):
+        params = {'type': etype, 'session_id': session_id}
+
+        if payload is not None:
+            params['payload'] = payload
+
+        self.emit_line(json.dumps({'jsonrpc': '2.0', 'method': 'event',
+                                   'params': params}, separators=(',', ':')))
+
+    # -- link ---------------------------------------------------------------
+
+    def read_token(self):
+        try:
+            with open(self.token_file, 'r') as f:
+                return f.read().strip()
+        except OSError as e:
+            raise WsError('cannot read %s: %s' % (self.token_file, e.strerror))
+
+    def connect(self):
+        token = self.read_token()
+
+        if not token:
+            raise WsError('%s is empty -- restart hermes-agent' % self.token_file)
+
+        self.sock, leftover = ws_open(self.host, self.port, token)
+        self.parser = WsParser()
+        self.rx = bytearray()
+        self.tx = bytearray()
+        self.connected = True
+        self.error = ''
+        self.backoff = RECONNECT_MIN
+        log('connected to %s:%d' % (self.host, self.port))
+        self.emit_event('bridge.status', {'connected': True,
+                                          'gateway': '%s:%d' % (self.host, self.port)})
+        self.write_state()
+
+        if leftover:
+            self.on_bytes(leftover)
+
+    def disconnect(self, reason):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+
+        self.sock = None
+        self.parser = None
+
+        if self.connected or self.error != reason:
+            self.connected = False
+            self.error = reason
+            self.emit_event('bridge.status', {'connected': False, 'error': reason})
+            self.write_state()
+
+        self.next_retry = time.monotonic() + self.backoff
+        self.backoff = min(self.backoff * 2, RECONNECT_MAX)
+
+    def send_frame(self, payload, opcode=OP_TEXT):
+        self.tx += ws_encode(payload, opcode)
+        self.flush_tx()
+
+    def flush_tx(self):
+        while self.tx and self.sock is not None:
+            try:
+                n = self.sock.send(self.tx)
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError as e:
+                self.disconnect('send failed: %s' % e.strerror)
+                return
+
+            if n <= 0:
+                return
+
+            del self.tx[:n]
+
+    # -- downstream ---------------------------------------------------------
+
+    def on_bytes(self, data):
+        try:
+            messages = self.parser.feed(data)
+        except WsError as e:
+            self.disconnect('protocol error: %s' % e)
+            return
+
+        for op, payload in messages:
+            if op == OP_PING:
+                self.send_frame(payload, OP_PONG)
+            elif op == OP_PONG:
+                pass
+            elif op == OP_CLOSE:
+                self.disconnect('gateway closed the websocket')
+                return
+            elif op in (OP_TEXT, OP_BIN):
+                self.on_payload(payload)
+
+    def on_payload(self, payload):
+        # The gateway writes newline-delimited JSON, one or more objects per
+        # frame, matching its stdio transport byte for byte.
+        self.rx += payload
+
+        while True:
+            nl = self.rx.find(b'\n')
+
+            if nl < 0:
+                break
+
+            line = bytes(self.rx[:nl])
+            del self.rx[:nl + 1]
+            line = line.strip()
+
+            if line:
+                self.on_message(line)
+
+        # A frame that carried no newline at all is still a complete message
+        # under the WS framing, so do not wait for one.
+        if self.rx and self.rx.strip().endswith(b'}'):
+            line = bytes(self.rx).strip()
+
+            try:
+                json.loads(line.decode('utf-8'))
+            except (ValueError, UnicodeDecodeError):
+                return
+
+            self.rx = bytearray()
+            self.on_message(line)
+
+    def on_message(self, line):
+        # Forwarded verbatim: the event log is a transcript, not a re-encoding,
+        # so a new Hermes release can add fields without touching this file.
+        self.emit_line(line)
+
+        try:
+            msg = json.loads(line.decode('utf-8'))
+        except (ValueError, UnicodeDecodeError):
+            return
+
+        if not isinstance(msg, dict):
+            return
+
+        rid = msg.get('id')
+
+        if rid is None or 'result' not in msg:
+            return
+
+        method = self.pending.pop(rid, None)
+        result = msg.get('result')
+
+        # Remember which session the page should reattach to after a reload, so
+        # the browser needs no client-side storage.
+        if method == 'session.create' and isinstance(result, dict):
+            sid = str(result.get('session_id') or '')
+
+            if sid:
+                self.active_session = sid
+                self.write_state()
+        elif method == 'session.close':
+            self.active_session = ''
+            self.write_state()
+
+    # -- upstream -----------------------------------------------------------
+
+    def scan_spool(self):
+        try:
+            names = sorted(os.listdir(self.req_dir))
+        except OSError:
+            return
+
+        for name in names:
+            # The writer lands requests with write-then-rename and uses a dot
+            # prefix for the temporary name, so skipping dotfiles is what makes
+            # the handoff atomic from this side.
+            if name.startswith('.'):
+                continue
+
+            path = os.path.join(self.req_dir, name)
+
+            try:
+                st = os.stat(path)
+
+                if st.st_size > REQUEST_MAX_BYTES:
+                    os.unlink(path)
+                    continue
+
+                with open(path, 'rb') as f:
+                    raw = f.read()
+            except OSError:
+                continue
+
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+            self.submit(raw)
+
+    def submit(self, raw):
+        try:
+            req = json.loads(raw.decode('utf-8'))
+        except (ValueError, UnicodeDecodeError) as e:
+            log('discarding malformed request: %s' % e)
+            return
+
+        if not isinstance(req, dict):
+            return
+
+        method = req.get('method')
+        params = req.get('params')
+        rid = req.get('id')
+
+        if not isinstance(method, str) or method not in ALLOWED_METHODS:
+            self.reject(rid, 'method not permitted over the bridge: %r' % (method,))
+            return
+
+        if params is None:
+            params = {}
+
+        if not isinstance(params, dict):
+            self.reject(rid, 'params must be an object')
+            return
+
+        if rid is not None:
+            if isinstance(rid, str):
+                if not _ID_RE.match(rid):
+                    self.reject(None, 'invalid request id')
+                    return
+            elif not isinstance(rid, int) or isinstance(rid, bool):
+                self.reject(None, 'invalid request id')
+                return
+
+        if self.sock is None:
+            self.reject(rid, self.error or 'the bridge is not connected to the gateway')
+            return
+
+        frame = {'jsonrpc': '2.0', 'method': method, 'params': params}
+
+        if rid is not None:
+            frame['id'] = rid
+
+            if len(self.pending) < 256:
+                self.pending[rid] = method
+
+        self.send_frame((json.dumps(frame, separators=(',', ':')) + '\n').encode('utf-8'))
+
+    def reject(self, rid, message):
+        """Synthesise a JSON-RPC error into the event log.
+
+        Callers never see a return value from chat_send -- they correlate on the
+        event stream -- so a locally rejected request has to appear there too,
+        or the page waits forever on a request that never left the box.
+        """
+        log('rejected request: %s' % message)
+        self.emit_line(json.dumps({
+            'jsonrpc': '2.0',
+            'id': rid,
+            'error': {'code': -32001, 'message': message},
+        }, separators=(',', ':')))
+
+    # -- loop ---------------------------------------------------------------
+
+    def stop(self, *_):
+        self.running = False
+
+    def run(self):
+        self.setup()
+        signal.signal(signal.SIGTERM, self.stop)
+        signal.signal(signal.SIGINT, self.stop)
+
+        while self.running:
+            now = time.monotonic()
+
+            if self.sock is None and now >= self.next_retry:
+                try:
+                    self.connect()
+                except (WsError, OSError) as e:
+                    reason = e.strerror if isinstance(e, OSError) and e.strerror else str(e)
+                    self.disconnect(reason)
+
+            wait = SPOOL_SCAN_INTERVAL
+
+            if self.sock is None:
+                wait = min(wait, max(0.05, self.next_retry - time.monotonic()))
+
+            rlist = [self.sock] if self.sock is not None else []
+            wlist = [self.sock] if (self.sock is not None and self.tx) else []
+
+            try:
+                r, w, _ = select.select(rlist, wlist, [], wait)
+            except InterruptedError:
+                continue
+            except OSError as e:
+                if e.errno == errno.EBADF:
+                    self.disconnect('socket closed underneath us')
+                    continue
+
+                raise
+
+            if w:
+                self.flush_tx()
+
+            if r:
+                try:
+                    data = self.sock.recv(65536)
+                except (BlockingIOError, InterruptedError):
+                    data = b''
+                except OSError as e:
+                    self.disconnect('recv failed: %s' % e.strerror)
+                    continue
+
+                if data == b'' and self.sock is not None:
+                    # A readable socket returning zero bytes is EOF.
+                    self.disconnect('gateway closed the connection')
+                    continue
+
+                if data:
+                    self.on_bytes(data)
+
+            now = time.monotonic()
+
+            if now - self.last_scan >= SPOOL_SCAN_INTERVAL:
+                self.last_scan = now
+                self.scan_spool()
+
+        if self.sock is not None:
+            try:
+                self.sock.sendall(ws_encode(struct.pack('!H', 1001), OP_CLOSE))
+            except OSError:
+                pass
+
+            self.sock.close()
+
+        self.connected = False
+        self.error = 'bridge stopped'
+        self.emit_event('bridge.status', {'connected': False, 'error': self.error})
+        self.write_state()
+        log('stopped')
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument('--host', default='127.0.0.1')
+    ap.add_argument('--port', type=int, default=9119)
+    ap.add_argument('--token-file', default='/var/run/hermes-agent.token')
+    ap.add_argument('--run-dir', default='/var/run/hermes-chat')
+    args = ap.parse_args()
+
+    if args.host not in ('127.0.0.1', 'localhost', '::1'):
+        # The bridge holds a credential for an agent that can run shell
+        # commands. It talks to loopback or it does not talk.
+        log('refusing to bridge to non-loopback host %s' % args.host)
+        return 2
+
+    Bridge(args).run()
+
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

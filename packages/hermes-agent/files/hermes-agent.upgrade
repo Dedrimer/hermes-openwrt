@@ -1,0 +1,7 @@
+# Paths preserved across sysupgrade (read by sbin/sysupgrade).
+#
+# Deliberately the two config files only, not the whole of /srv/hermes: the
+# session database and caches under there can grow to hundreds of megabytes and
+# have no business in a firmware backup.
+/srv/hermes/config.yaml
+/srv/hermes/.env

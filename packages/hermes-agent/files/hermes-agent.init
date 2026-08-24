@@ -1,61 +1,126 @@
 #!/bin/sh /etc/rc.common
-
-START=99
-STOP=10
+# procd service for the Hermes gateway.
+#
+# `hermes serve` is the headless JSON-RPC/WebSocket gateway (the same server as
+# `hermes dashboard`, minus the browser UI). It binds loopback only: Hermes
+# skips authentication for loopback binds and *requires* an auth provider for
+# any public bind, so exposing it to the LAN directly would either be insecure
+# or refuse to start. LuCI reaches it through hermes-chatd, a local bridge.
 
 USE_PROCD=1
+START=95
+STOP=10
+
+NAME=hermes-agent
 PROG=/usr/bin/hermes
+HERMES_HOME_DIR=/srv/hermes
+TOKEN_FILE=/var/run/hermes-agent.token
 
-HERMES_HOME=/etc/hermes
+_log() { logger -t "$NAME" -p "daemon.$1" "$2"; }
 
-# Instance-aware start: /etc/init.d/hermes-agent start [gateway|dashboard]
-# With no instance argument every enabled instance is (re)started.
+# Mint the credential the gateway's websocket endpoint demands.
+#
+# /api/ws requires a ?token= parameter *even on loopback* (_ws_auth_reason in
+# hermes_cli/web_server.py rejects an empty token outright). Left alone, Hermes
+# generates a random one per process with secrets.token_urlsafe() and only ever
+# prints it into the dashboard HTML -- unreachable for us. But
+# _resolve_session_token() checks HERMES_DASHBOARD_SESSION_TOKEN first, so we
+# generate the token ourselves and hermes-wrapper exports it. No Hermes source
+# change, and the bridge gets a value it can read.
+#
+# Written once per boot rather than per start: /var/run is tmpfs, so it is
+# naturally fresh after a reboot, while a `restart` here must not invalidate the
+# token hermes-chatd is already holding.
+#
+# Deliberately *not* passed with procd_set_param env: our rpcd ACL grants read
+# access to `service list`, and a verbose listing includes instance env, which
+# would hand the token to any authenticated LuCI user.
+mint_token() {
+	[ -s "$TOKEN_FILE" ] && return 0
+
+	(
+		umask 077
+		dd if=/dev/urandom bs=32 count=1 2>/dev/null | md5sum | cut -d' ' -f1 > "$TOKEN_FILE"
+	)
+
+	[ -s "$TOKEN_FILE" ] || {
+		_log err "failed to generate $TOKEN_FILE"
+		return 1
+	}
+
+	chmod 0600 "$TOKEN_FILE"
+	return 0
+}
+
 start_service() {
-	local inst="${1:-}"
-	local enabled profile bind port insecure
+	config_load "$NAME"
 
-	config_load hermes-agent
+	local enabled host port log_level workdir
+	config_get_bool enabled serve enabled 0
+	config_get host      serve host      '127.0.0.1'
+	config_get port      serve port      '9119'
+	config_get log_level serve log_level 'info'
+	config_get workdir   serve workdir   "$HERMES_HOME_DIR/workspace"
 
-	# gateway instance
-	config_get_bool enabled gateway enabled 0
-	config_get profile gateway profile default
+	[ "$enabled" -eq 1 ] || {
+		_log info "serve disabled in /etc/config/$NAME; not starting"
+		return 0
+	}
 
-	if [ -z "$inst" ] || [ "$inst" = "gateway" ]; then
-		if [ "$enabled" = "1" ]; then
-			procd_open_instance gateway
-			procd_set_param command "$PROG" gateway run --replace --external-supervisor
-			procd_set_param env HERMES_HOME="$HERMES_HOME"
-			[ -n "$profile" ] && [ "$profile" != "default" ] && \
-				procd_set_param env HERMES_PROFILE="$profile"
-			procd_set_param respawn 3600 5 5
-			procd_set_param file /etc/config/hermes-agent
-			procd_close_instance
-		fi
-	fi
+	# Refuse a non-loopback bind rather than starting an unauthenticated
+	# agent gateway on the LAN. Hermes itself would demand an auth provider
+	# here; failing loudly at start is friendlier than a confusing crash.
+	case "$host" in
+		127.0.0.1|::1|localhost) : ;;
+		*)
+			_log err "refusing to bind $host: the gateway must stay on loopback. Use the LuCI page, which reaches it through the local hermes-chatd bridge."
+			return 1
+			;;
+	esac
 
-	# dashboard instance (headless `hermes serve`)
-	config_get_bool enabled dashboard enabled 0
-	config_get bind dashboard bind 127.0.0.1
-	config_get port dashboard port 9119
-	config_get_bool insecure dashboard insecure 0
+	[ -f "$HERMES_HOME_DIR/config.yaml" ] || {
+		_log err "$HERMES_HOME_DIR/config.yaml is missing; reinstall hermes-agent"
+		return 1
+	}
 
-	if [ -z "$inst" ] || [ "$inst" = "dashboard" ]; then
-		if [ "$enabled" = "1" ]; then
-			local serve_cmd="$PROG serve --host $bind --port $port --no-open"
-			[ "$insecure" = "1" ] && serve_cmd="$serve_cmd --insecure"
-			procd_open_instance dashboard
-			procd_set_param command $serve_cmd
-			procd_set_param env HERMES_HOME="$HERMES_HOME"
-			procd_set_param respawn 3600 5 5
-			procd_set_param file /etc/config/hermes-agent
-			procd_close_instance
-		fi
-	fi
+	mint_token || return 1
+
+	mkdir -p "$workdir"
+
+	procd_open_instance serve
+	procd_set_param command "$PROG" serve \
+		--host "$host" \
+		--port "$port" \
+		--skip-build
+
+	# Hermes reads .env itself, but procd children inherit nothing, so give it
+	# an explicit HOME/HERMES_HOME even though the wrapper defaults them.
+	procd_set_param env \
+		HERMES_HOME="$HERMES_HOME_DIR" \
+		HOME="$HERMES_HOME_DIR" \
+		HERMES_LOG_LEVEL="$log_level"
+
+	procd_set_param cwd "$workdir"
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param pidfile /var/run/$NAME-serve.pid
+
+	# Config and secrets: procd restarts the service when either changes.
+	procd_set_param file "$HERMES_HOME_DIR/config.yaml"
+	procd_close_instance
+
+	_log info "gateway starting on $host:$port"
+}
+
+stop_service() {
+	_log info "gateway stopping"
+}
+
+service_triggers() {
+	procd_add_reload_trigger "$NAME"
 }
 
 reload_service() {
-	local inst="${1:-}"
-
-	stop "$inst"
-	start "$inst"
+	restart
 }

@@ -1,0 +1,20 @@
+# Hermes configuration, seeded by the hermes-agent package on first install.
+# Copied to /srv/hermes/config.yaml; never overwritten on upgrade.
+#
+# Hermes owns and rewrites this file (the LuCI page and `hermes config` both
+# edit it), so treat it as live state rather than a package-managed conffile.
+# It is preserved across sysupgrade via /lib/upgrade/keep.d/hermes-agent.
+
+security:
+  # A router has no compiler and a small read-mostly overlay. Hermes can
+  # otherwise pip-install optional backends on first use, which here would
+  # either fail confusingly or fill the flash. This is the absolute kill
+  # switch (HERMES_DISABLE_LAZY_INSTALLS alone still allows installs when a
+  # durable target is set).
+  allow_lazy_installs: false
+
+# Set your provider and model from the LuCI page, or by hand here. The matching
+# API key belongs in /srv/hermes/.env, not in this file.
+#
+# provider: openai
+# model: gpt-4o-mini

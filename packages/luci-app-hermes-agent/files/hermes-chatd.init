@@ -1,0 +1,82 @@
+#!/bin/sh /etc/rc.common
+# procd service for hermes-chatd, the LuCI chat bridge.
+#
+# The bridge holds one websocket to the gateway on behalf of the LuCI page; see
+# the header of /usr/sbin/hermes-chatd for why a CGI cannot do this job. It is
+# part of luci-app-hermes-agent rather than hermes-agent because it exists purely
+# to serve the web UI -- a CLI-only install has no use for it.
+#
+# START is after the gateway's 95 so a fresh boot usually connects first try;
+# the bridge reconnects on its own regardless, so ordering is a nicety.
+
+USE_PROCD=1
+START=96
+STOP=9
+
+NAME=hermes-chatd
+PROG=/usr/sbin/hermes-chatd
+CONF=hermes-agent
+RUN_DIR=/var/run/hermes-chat
+TOKEN_FILE=/var/run/hermes-agent.token
+
+_log() { logger -t "$NAME" -p "daemon.$1" "$2"; }
+
+start_service() {
+	config_load "$CONF"
+
+	local enabled host port
+	config_get_bool enabled serve enabled 0
+	config_get host serve host '127.0.0.1'
+	config_get port serve port '9119'
+
+	# Follow the gateway: with no gateway there is nothing to bridge, and
+	# starting anyway would just log a reconnect attempt every 30 seconds.
+	[ "$enabled" -eq 1 ] || {
+		_log info "serve disabled in /etc/config/$CONF; not starting"
+		return 0
+	}
+
+	case "$host" in
+		127.0.0.1|::1|localhost) : ;;
+		*)
+			_log err "refusing to bridge to non-loopback host $host"
+			return 1
+			;;
+	esac
+
+	mkdir -p "$RUN_DIR"
+	chmod 0700 "$RUN_DIR"
+
+	procd_open_instance bridge
+	procd_set_param command "$PROG" \
+		--host "$host" \
+		--port "$port" \
+		--token-file "$TOKEN_FILE" \
+		--run-dir "$RUN_DIR"
+
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param pidfile /var/run/$NAME.pid
+	procd_close_instance
+
+	_log info "bridging $host:$port for the LuCI chat page"
+}
+
+stop_service() {
+	# Leave the event log in place: the chat page reads it to render a
+	# "disconnected" banner with the reason, which the daemon writes on its way
+	# out. It is tmpfs, capped at 1 MiB, and cleared on the next start.
+	_log info "bridge stopping"
+}
+
+service_triggers() {
+	# Host, port and the enable flag all live in the gateway's config, so a
+	# change there has to reach the bridge too. procd_add_reload_trigger on the
+	# same file the gateway watches keeps the two in step.
+	procd_add_reload_trigger "$CONF"
+}
+
+reload_service() {
+	restart
+}

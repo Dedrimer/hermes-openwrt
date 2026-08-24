@@ -1,0 +1,122 @@
+#!/bin/sh
+# Hermes Agent launcher for OpenWrt.
+#
+# This wrapper is the entire mechanism by which Hermes runs unmodified on
+# OpenWrt. Upstream reads all of these variables itself (they exist for the Nix
+# and Homebrew packages); we just point them at OpenWrt paths. Nothing here
+# patches or rewrites Hermes.
+#
+# Installed as /usr/bin/hermes with /usr/bin/hermes-agent and /usr/bin/hermes-acp
+# symlinked to it; the real entry point is chosen from $0.
+#
+# Placeholders are substituted at package build time.
+
+PREFIX="@PREFIX@"
+SHARE="@SHARE@"
+SITE="@SITE@"
+
+# --- private python environment -------------------------------------------
+# A venv would need its own interpreter copy; PYTHONPATH onto a private
+# site-packages achieves the same isolation for free, and importlib.metadata
+# still finds the .dist-info dirs there.
+#
+# The shims directory comes last: it holds stdlib modules OpenWrt's python3
+# packaging does not ship (webbrowser -- see shims/webbrowser.py), and being
+# last means it can never shadow a real dependency.
+PYTHONPATH="$SITE:$PREFIX/shims${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+export PYTHONNOUSERSITE=1
+export PYTHONDONTWRITEBYTECODE=1
+
+# Alpine's libc soname, which musllinux wheels link against, resolved to
+# OpenWrt's musl. Scoped to this process tree only.
+LD_LIBRARY_PATH="$PREFIX/compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH
+
+# Dependency console scripts, so agent tools can shell out to them.
+PATH="$PREFIX/bin:$PATH"
+export PATH
+
+# --- state and config ------------------------------------------------------
+# HERMES_HOME is the single root Hermes owns: config.yaml, .env, session DB,
+# caches. Upstream supports pointing it outside ~/.hermes for packaged installs.
+: "${HERMES_HOME:=@HOME@}"
+export HERMES_HOME
+
+# Hermes and its libraries otherwise scribble into ~; on OpenWrt root's home is
+# on the overlay and $HOME may be unset entirely (procd, cron, CGI).
+HOME="$HERMES_HOME"
+export HOME
+export XDG_CACHE_HOME="$HERMES_HOME/cache"
+export XDG_CONFIG_HOME="$HERMES_HOME"
+export XDG_DATA_HOME="$HERMES_HOME/data"
+
+# --- bundled assets --------------------------------------------------------
+# Upstream resolves each of these via an env var first, falling back to a
+# source-checkout layout that does not exist in a package install. Without
+# these, skills and UI strings surface as raw keys.
+export HERMES_BUNDLED_SKILLS="$SHARE/skills"
+export HERMES_BUNDLED_PLUGINS="$SHARE/plugins"
+export HERMES_BUNDLED_LOCALES="$SHARE/locales"
+export HERMES_OPTIONAL_MCPS="$SHARE/optional-mcps"
+[ -d "$SHARE/optional-skills" ] && export HERMES_OPTIONAL_SKILLS="$SHARE/optional-skills"
+
+# --- interpreter and toolchain --------------------------------------------
+export HERMES_PYTHON="/usr/bin/python3"
+export HERMES_BIN="/usr/bin/hermes"
+
+# Deliberately NOT set: HERMES_WEB_DIST and HERMES_TUI_DIR. We do not ship the
+# React dashboard or the Node TUI -- LuCI is the interface. `hermes serve`
+# already runs headless (it sets HERMES_SERVE_HEADLESS=1 and skips the SPA
+# mount), so leaving these unset is the correct signal rather than an omission.
+
+# Node is optional and only needed by a few plugins. Advertise it if the user
+# installed it, and otherwise stop Hermes from trying to bootstrap its own
+# (which would attempt a network install of nvm/fnm on a router).
+if command -v node >/dev/null 2>&1; then
+	HERMES_NODE="$(command -v node)"
+	export HERMES_NODE
+else
+	export HERMES_SKIP_NODE_BOOTSTRAP=1
+fi
+
+# Seal runtime pip installs. Belt and braces: the env var alone still permits
+# installs when a durable target is configured, so config.yaml also carries
+# security.allow_lazy_installs: false, which is the absolute kill switch.
+# A router has no compiler and a read-mostly overlay; a surprise pip install
+# would either fail confusingly or fill the flash.
+export HERMES_DISABLE_LAZY_INSTALLS=1
+
+# TLS trust store, from the ca-bundle dependency.
+if [ -z "${HERMES_CA_BUNDLE:-}" ] && [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+	export HERMES_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+fi
+
+# Version/revision reporting without a .git dir present.
+export HERMES_REVISION="@REVISION@"
+
+# Websocket credential for the gateway. /api/ws demands a ?token= even when the
+# bind is loopback, and _resolve_session_token() in hermes_cli/web_server.py
+# takes HERMES_DASHBOARD_SESSION_TOKEN in preference to minting a random one.
+# The init script writes the file; picking it up here means the LuCI bridge and
+# the gateway agree on a token without patching Hermes, and without the value
+# passing through procd's environment (visible via `ubus call service list`).
+if [ -z "${HERMES_DASHBOARD_SESSION_TOKEN:-}" ] && [ -r /var/run/hermes-agent.token ]; then
+	HERMES_DASHBOARD_SESSION_TOKEN="$(cat /var/run/hermes-agent.token)"
+	export HERMES_DASHBOARD_SESSION_TOKEN
+fi
+
+# --- dispatch --------------------------------------------------------------
+name="${0##*/}"
+case "$name" in
+	hermes|hermes-agent|hermes-acp) : ;;
+	*) name="hermes" ;;
+esac
+
+target="$PREFIX/bin/$name"
+if [ ! -x "$target" ]; then
+	echo "hermes: entry point $name is not installed at $target" >&2
+	exit 127
+fi
+
+exec "$target" "$@"
