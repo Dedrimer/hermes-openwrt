@@ -23,12 +23,17 @@ scp hermes-agent* luci-app-hermes-agent* root@192.168.1.1:/tmp/
 
 # --- OpenWrt 24.10（opkg / .ipk）---
 opkg update
-opkg install /tmp/hermes-agent_*.ipk /tmp/luci-app-hermes-agent_*.ipk
+opkg install /tmp/hermes-agent[-_]*.ipk /tmp/luci-app-hermes-agent[-_]*.ipk
 
 # --- OpenWrt 25.12（apk / .apk）---
 apk update
-apk add --allow-untrusted /tmp/hermes-agent-*.apk /tmp/luci-app-hermes-agent-*.apk
+apk add --allow-untrusted /tmp/hermes-agent[-_]*.apk /tmp/luci-app-hermes-agent[-_]*.apk
 ```
+
+glob 写成 `[-_]` 是因为两种来源的文件名分隔符不同：自己构建出来的 apk 叫
+`hermes-agent-0.20.5-r1.apk`，而 Releases 页上的资产统一改成了
+`hermes-agent_0.20.5-r1_openwrt-25.12_x86_64.apk`——apk 的文件名里不带架构，四个目标
+的产物会撞名。两个包管理器都从包内部读元数据，文件名叫什么都不影响安装。
 
 `--allow-untrusted` 是因为本地文件没有仓库签名。如果路由器上不了网，就把这两个包
 和 `python3`、`ca-bundle`、`luci-base`、`rpcd-mod-ucode` 一起离线带过去。

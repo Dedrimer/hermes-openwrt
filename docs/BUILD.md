@@ -169,6 +169,13 @@ sh scripts/check-sources.sh
 （**不是** `ucode -T`——那是模板模式，任何输入都会 exit 0），没有时退回 node 做近似
 语法检查。
 
+装了 PyYAML 时它还会体检 `.github/workflows/*.yml`：解析 YAML、把每个 `run:` 块里的
+`${{ … }}` 替换成一个惰性词之后交给 `bash -n`、并核对 workflow 里引用的每个
+`scripts/*.sh|py` 都存在。这三样都是「一小时后才炸」的那类错误——GitHub 对解析不了的
+workflow 是**静默忽略**的（不运行、不报错、Actions 页里也看不出来），`run:` 里少一个
+`fi` 要等那一步真的跑到，而一个改了名的脚本会在四条腿都绿了之后、在发版的最后一个
+job 里才炸。
+
 构建后：
 
 ```sh
@@ -292,6 +299,54 @@ pin 的上游 commit 重新解析依赖，核对 `deps/*.mk` 没被手改过）�
 用 AppArmor 限制了非特权用户命名空间，不解开的话 bwrap 起不来），多两三分钟，换来
 的是唯一一层真的**执行**目标代码的验证。aarch64 那两条腿跑不了：沙箱里跑的是目标
 真二进制。
+
+### 发版：`.github/workflows/release.yml`（只能手动触发）
+
+Actions → **release** → Run workflow。没有任何 push 会触发它——发版是一个决定，不是
+提交的副作用。两个可选输入：
+
+| 输入 | 默认 | 说明 |
+| --- | --- | --- |
+| `tag` | `v<PKG_VERSION>-r<PKG_RELEASE>` | 从两个 Makefile 读；版本必须一致，`PKG_RELEASE` 取较大的那个（现在是 `v0.20.5-r2`）。tag 或同名 release 已存在就直接失败，不覆盖已经有人下载过的产物 |
+| `highlights` | 空 | 一段 Markdown，放在 release 说明最上面 |
+
+顺序是 `prepare`（解析并占住 tag）→ `lint` → `build` 四条腿 → `release`。
+tag 的合法性和重名在**花掉一小时构建之前**就检查完；`release` job `needs` 全部四条腿，
+所以任何一条红了就既没有 tag 也没有 release，没有半成品要清理。构建腿里刻意**没有**
+`if: always()`——`build-info.env` 只在这条腿所有检查都过了之后才写出来，它的存在就是
+「这条腿全绿」的凭据。全流程只有最后一个 job 有 `contents: write`。
+
+产物在上传前会**改名**：
+
+```
+hermes-agent_0.20.5-r1_openwrt-25.12_x86_64.apk
+luci-app-hermes-agent_0.20.5-r2_openwrt-24.10_aarch64_generic.ipk
+```
+
+因为 apk 的文件名是 `<包>-<版本>-r<rel>.apk`，**里面根本不带架构**——两条 25.12 的腿
+会产出内容不同、名字完全一样的文件，而一个 release 是一个扁平命名空间。两个包管理器
+都从包内部读元数据，所以改名不影响安装（但 `apk add` 的 glob 要写成 `hermes-agent[-_]*`）。
+`release` job 另外断言了：四条腿都在、8 个包、没有重名。
+
+说明由 `scripts/release-notes.sh` 生成，里面的每个数字都是从产物和工作树里读出来的
+（包版本读 Makefile、依赖闭包数读 `deps.lock.json`、SDK 版本和 Python 小版本读每条腿
+写下的 `build-info.env`），没有一处是手抄的。想在发版前看一眼渲染效果，本地就能干跑：
+
+```sh
+d=$(mktemp -d); mkdir "$d/leg"
+cp sdk/bin/packages/*/hermes-openwrt/*.apk "$d/leg/"
+printf 'release=25.12\narch=x86_64\nfmt=apk\nsdk_version=25.12.5\npython=3.13\nartifacts_check=pass\nsmoke=pass\n' \
+	> "$d/leg/build-info.env"
+sh scripts/release-notes.sh "$d" v0.0.0-test | less
+```
+
+它不联网、不碰 GitHub API，缺 `GITHUB_REPOSITORY` 时链接自动退化成纯文件名。
+
+`release.yml` 里的构建矩阵是 `build.yml` 的一份**副本**，不是 `workflow_call`：这样
+push/PR 的门禁保持原样，也不会因为改 CI 而影响一次发版。重复的只是胶水（apt 包、
+下载 SDK、挂 feed），真正有知识含量的部分（`sdk-trim-config.sh`、`check-artifacts.sh`、
+`smoke/run.sh`）都在 `scripts/` 里，两个 workflow 调的是同一份。哪天胶水开始漂移，
+就把 `build.yml` 改成可复用 workflow，而不是手工同步两份。
 
 ## 七、多 SDK 批量构建（可选）
 

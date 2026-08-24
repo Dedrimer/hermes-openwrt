@@ -1,0 +1,435 @@
+# Build all four target combinations and publish them as a GitHub release.
+#
+# Manual only -- Actions -> release -> Run workflow. Nothing here fires on a
+# push: cutting a release is a decision, not a consequence of committing.
+#
+#     prepare  resolve and reserve the tag (fails if it already exists)
+#     lint     the same static gate the push CI runs
+#     build    4 legs: 25.12/24.10 x x86_64/rockchip-armv8, each verified
+#     release  create the tag, upload 8 packages + sha256sums, write the notes
+#
+# The release job needs every leg, so a single red check leaves no tag and no
+# release behind -- nothing half-published to clean up. There is no draft step:
+# `gh release create` is the last thing that runs, after everything that can
+# fail already has.
+#
+# KEEP IN SYNC WITH build.yml. The build matrix below is deliberately a copy
+# rather than a `workflow_call` into build.yml, so that the push/PR gate stays
+# exactly what it is and a release run cannot be affected by an edit meant for
+# CI. What is duplicated is only glue -- apt packages, SDK download, feeds
+# setup; everything that encodes real knowledge (sdk-trim-config.sh,
+# check-artifacts.sh, smoke/run.sh) lives in scripts/ and is called from both.
+# If the glue ever starts drifting, promote build.yml to a reusable workflow
+# instead of syncing two copies by hand.
+
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to create. Default: v<PKG_VERSION>-r<PKG_RELEASE> read from the Makefiles.'
+        required: false
+        type: string
+      highlights:
+        description: 'Optional Markdown placed at the top of the release notes.'
+        required: false
+        type: string
+
+# Never cancel a release run: one killed between `gh release create` and the
+# asset upload would leave a published tag with an incomplete asset set.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Decide the tag before spending an hour of runner time on a build that cannot
+  # be published anyway.
+  prepare:
+    name: resolve tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          mkvar() { sed -n "s/^$2:=\(.*\)$/\1/p" "$1" | head -n1; }
+
+          av=$(mkvar packages/hermes-agent/Makefile PKG_VERSION)
+          ar=$(mkvar packages/hermes-agent/Makefile PKG_RELEASE)
+          lv=$(mkvar packages/luci-app-hermes-agent/Makefile PKG_VERSION)
+          lr=$(mkvar packages/luci-app-hermes-agent/Makefile PKG_RELEASE)
+          test -n "${av}" && test -n "${ar}" && test -n "${lv}" && test -n "${lr}"
+          echo "hermes-agent ${av}-r${ar}, luci-app-hermes-agent ${lv}-r${lr}"
+
+          if [ -n "${INPUT_TAG}" ]; then
+            tag=${INPUT_TAG}
+          else
+            # The two packages are version-tracked together and PKG_RELEASE moves
+            # independently for packaging-only fixes, so the tag carries the
+            # higher release. A version split means the intent is genuinely
+            # ambiguous -- say so rather than invent a tag.
+            if [ "${av}" != "${lv}" ]; then
+              echo "::error::PKG_VERSION differs (hermes-agent ${av}, luci-app ${lv}); pass an explicit tag"
+              exit 1
+            fi
+            r=${ar}
+            [ "${lr}" -le "${ar}" ] || r=${lr}
+            tag="v${av}-r${r}"
+          fi
+
+          case ${tag} in
+            v[0-9]*) ;;
+            *) echo "::error::tag '${tag}' does not look like vX.Y.Z[-rN]"; exit 1 ;;
+          esac
+
+          # Reusing a tag would silently replace artifacts somebody may already
+          # have downloaded and checksummed. Both checks are needed: a draft
+          # release has no git tag, and a tag can exist without a release.
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "::error::tag ${tag} already exists"
+            exit 1
+          fi
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "::error::a release named ${tag} already exists (a draft counts)"
+            exit 1
+          fi
+
+          echo "tag: ${tag}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "### Releasing \`${tag}\` from \`${GITHUB_SHA}\`" >> "${GITHUB_STEP_SUMMARY}"
+
+  # Fast gate, identical to build.yml's. It catches the failure mode that is
+  # otherwise only visible on a real router: a syntax error in a LuCI view, a
+  # menu entry pointing at a view that does not exist, or an ubus method a view
+  # calls but the ACL does not grant.
+  lint:
+    name: static checks
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ucode
+        run: |
+          sudo apt-get update -qq
+          # Not in every Ubuntu image; check-sources.sh falls back to node when
+          # it is absent, so this is best-effort.
+          sudo apt-get install -y -qq ucode || echo "ucode unavailable, will use the node fallback"
+
+      - name: Run static checks
+        run: sh scripts/check-sources.sh
+
+      # deps/*.mk and deps.lock.json are generated from upstream's uv.lock at the
+      # exact commit the Makefile pins. Re-resolving from that commit must
+      # reproduce them byte for byte; if it does not, someone hand-edited a
+      # generated file and the next upgrade would silently revert it. Shipping a
+      # release whose dependency set nobody can reproduce is worse than not
+      # shipping one.
+      - name: Verify the dependency lock matches the pinned upstream commit
+        run: |
+          set -eu
+          ref="$(sed -n 's/^PKG_SOURCE_VERSION:=\(.*\)$/\1/p' packages/hermes-agent/Makefile)"
+          test -n "${ref}"
+          echo "pinned upstream commit: ${ref}"
+          python3 scripts/sync-deps.py --ref "${ref}" --check
+
+  build:
+    name: ${{ matrix.release }} ${{ matrix.name }} (${{ matrix.fmt }})
+    needs: [prepare, lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      # No fail-fast: when one leg breaks it is worth knowing whether the other
+      # three are fine before starting over.
+      fail-fast: false
+      matrix:
+        include:
+          - release: '25.12'
+            name: x86-64
+            target: x86
+            subtarget: '64'
+            fmt: apk
+          - release: '25.12'
+            name: rockchip-armv8
+            target: rockchip
+            subtarget: armv8
+            fmt: apk
+          - release: '24.10'
+            name: x86-64
+            target: x86
+            subtarget: '64'
+            fmt: ipk
+          - release: '24.10'
+            name: rockchip-armv8
+            target: rockchip
+            subtarget: armv8
+            fmt: ipk
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential clang flex bison gawk g++ gcc-multilib \
+            gettext git libncurses-dev libssl-dev python3 python3-setuptools \
+            rsync unzip zlib1g-dev file zstd \
+            swig python3-pyelftools
+          # swig and pyelftools are not ours: `make` runs the prereq phase for
+          # every package the SDK has selected, and uboot-rockchip's prereq
+          # demands them. The trim step below deselects u-boot anyway, but a
+          # release should not fail over a host package this cheap to add.
+
+      - name: Resolve SDK URL
+        id: sdk
+        run: |
+          set -eu
+          ver="$(curl -fsSL https://downloads.openwrt.org/releases/ \
+            | grep -oE '${{ matrix.release }}\.[0-9]+' | sort -V | tail -n1)"
+          test -n "${ver}"
+          base="https://downloads.openwrt.org/releases/${ver}/targets/${{ matrix.target }}/${{ matrix.subtarget }}"
+          url="$(curl -fsSL "${base}/" | grep -oE 'openwrt-sdk-[^"<]*\.tar\.(xz|zst)' | head -n1 | sed "s|^|${base}/|")"
+          test -n "${url}"
+          echo "SDK release: ${ver}"
+          echo "SDK URL: ${url}"
+          echo "version=${ver}" >> "${GITHUB_OUTPUT}"
+          echo "url=${url}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download and extract SDK
+        run: |
+          set -eu
+          mkdir -p sdk
+          url='${{ steps.sdk.outputs.url }}'
+          curl -fsSL "${url}" -o "sdk.tar.${url##*.}"
+          # 24.10 ships .tar.xz, 25.12 switched to .tar.zst.
+          case "${url}" in
+            *.zst) tar --zstd -xf sdk.tar.zst --strip-components=1 -C sdk ;;
+            *)     tar -xJf sdk.tar.xz --strip-components=1 -C sdk ;;
+          esac
+          rm -f sdk.tar.*
+
+      - name: Setup feeds and select only this feed's packages
+        working-directory: sdk
+        run: |
+          set -eu
+          ./scripts/feeds update -a
+          ./scripts/feeds src-link hermes-openwrt "${GITHUB_WORKSPACE}/packages" 2>/dev/null || \
+            echo "src-link hermes-openwrt ${GITHUB_WORKSPACE}/packages" >> feeds.conf
+          ./scripts/feeds update hermes-openwrt
+          ./scripts/feeds install -a
+
+          # An SDK arrives with all 6683 packages of every feed selected, which
+          # cannot be undone from .config alone nor from Config-build.in alone.
+          # The script does both, runs defconfig and asserts the result; see the
+          # comment in it, and docs/BUILD.md, for why a partial kmod selection is
+          # worse than no trim at all.
+          sh "${GITHUB_WORKSPACE}/scripts/sdk-trim-config.sh" .
+
+          echo "selected: $(grep -c '^CONFIG_PACKAGE_.*=[ym]' .config) packages, $(grep -c '^CONFIG_PACKAGE_kmod.*=[ym]' .config) kmods"
+          grep -E '^CONFIG_PACKAGE_(hermes-agent|luci-app-hermes-agent)=' .config
+          grep -hE '^CONFIG_(ARCH|TARGET_ARCH_PACKAGES)=' .config
+
+      - name: Build hermes-agent
+        working-directory: sdk
+        run: make package/hermes-agent/compile V=s -j"$(nproc)"
+
+      - name: Build luci-app-hermes-agent
+        working-directory: sdk
+        run: make package/luci-app-hermes-agent/compile V=s -j"$(nproc)"
+
+      # Unpack both packages and assert the files the Makefiles promise are
+      # actually in them. A missing $(INSTALL_BIN) line does not fail a build, it
+      # ships a package that installs cleanly and does nothing.
+      - name: Verify package contents
+        run: sh scripts/check-artifacts.sh sdk
+
+      # The only layer that executes target code: install into this release's own
+      # rootfs and run it. x86_64 only, by nature -- the sandbox runs the
+      # target's real binaries on the runner.
+      - name: Runtime smoke test
+        if: matrix.target == 'x86'
+        run: |
+          set -eu
+          sudo apt-get install -y -qq bubblewrap
+          # Ubuntu 24.04 confines unprivileged user namespaces with AppArmor,
+          # which is precisely what bwrap needs.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sh scripts/smoke/run.sh sdk "${RUNNER_TEMP}/smoke"
+
+      # No `if: always()` anywhere below, unlike build.yml: a leg that failed a
+      # check must contribute nothing. The presence of build-info.env is what
+      # tells the release job this leg passed everything above it.
+      - name: Collect packages and record build info
+        run: |
+          set -eu
+          mkdir -p artifacts
+
+          arch=$(sed -n 's/^CONFIG_TARGET_ARCH_PACKAGES="\(.*\)"$/\1/p' sdk/.config)
+          test -n "${arch}"
+
+          n=0
+          for f in $(find sdk/bin -type f \
+            \( -name 'hermes-agent[-_][0-9]*' -o -name 'luci-app-hermes-agent[-_][0-9]*' \) | sort)
+          do
+            b=${f##*/}
+            ext=${b##*.}
+            stem=${b%.*}
+            case ${b} in
+              luci-app-hermes-agent?*) pkg=luci-app-hermes-agent ;;
+              hermes-agent?*)          pkg=hermes-agent ;;
+              *) echo "::error::unexpected artifact ${b}"; exit 1 ;;
+            esac
+
+            # A release is one flat namespace, and apk names files
+            # <pkg>-<ver>-r<rel>.apk with no architecture in them at all -- so the
+            # two 25.12 legs produce byte-different files with identical names.
+            # Rebuild the name from the parts we know instead of hoping the
+            # format carries them. Both package managers read their metadata from
+            # inside the archive, so the file name is ours to choose.
+            rest=${stem#"${pkg}"?}   # drop the package name and its separator
+            ver=${rest%%_*}          # .ipk appends _<arch>; .apk does not
+            cp -v "${f}" "artifacts/${pkg}_${ver}_openwrt-${{ matrix.release }}_${arch}.${ext}"
+            n=$((n + 1))
+          done
+          if [ "${n}" -ne 2 ]; then
+            echo "::error::expected 2 packages from this leg, collected ${n}"
+            exit 1
+          fi
+
+          # PYTHON3_VERSION is what the Makefile itself uses to pick the wheel
+          # set (cp311 on 24.10, cp313 on 25.12), so record the value this build
+          # actually saw rather than the one the docs claim.
+          py=
+          vm=sdk/feeds/packages/lang/python/python3-version.mk
+          if [ -f "${vm}" ]; then
+            py="$(sed -n 's/^PYTHON3_VERSION_MAJOR:=//p' "${vm}" | head -n1)"
+            py="${py}.$(sed -n 's/^PYTHON3_VERSION_MINOR:=//p' "${vm}" | head -n1)"
+            [ "${py}" != "." ] || py=
+          fi
+          if [ -z "${py}" ]; then
+            py=$(ls -d sdk/staging_dir/target-*/usr/lib/python3.* 2>/dev/null |
+              head -n1 | sed 's|.*/python||')
+          fi
+
+          {
+            echo "release=${{ matrix.release }}"
+            echo "target=${{ matrix.target }}/${{ matrix.subtarget }}"
+            echo "arch=${arch}"
+            echo "fmt=${{ matrix.fmt }}"
+            echo "sdk_version=${{ steps.sdk.outputs.version }}"
+            echo "sdk_file=$(basename '${{ steps.sdk.outputs.url }}')"
+            echo "python=${py}"
+            echo "artifacts_check=pass"
+            echo "smoke=${{ matrix.target == 'x86' && 'pass' || 'n/a' }}"
+          } > artifacts/build-info.env
+
+          cat artifacts/build-info.env
+          ls -la artifacts/
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkgs-${{ matrix.fmt }}-${{ matrix.release }}-${{ matrix.name }}
+          path: artifacts/
+          retention-days: 14
+          if-no-files-found: error
+
+  release:
+    name: publish ${{ needs.prepare.outputs.tag }}
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # Everything up to here runs read-only; only this job can write, and the
+      # only thing it writes is the tag, the release and its assets.
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # release-notes.sh lists the commits since the previous tag, which
+          # needs the tags and the history behind them.
+          fetch-depth: 0
+
+      - name: Download every leg's packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pkgs-*
+          path: dist
+
+      - name: Assemble and verify the asset set
+        run: |
+          set -eu
+          find dist -type f | sort
+
+          legs=$(find dist -mindepth 1 -maxdepth 1 -type d | wc -l)
+          if [ "${legs}" -ne 4 ]; then
+            echo "::error::expected 4 build legs, found ${legs}"
+            exit 1
+          fi
+
+          mkdir -p assets
+          for f in $(find dist -type f \( -name '*.apk' -o -name '*.ipk' \) | sort); do
+            if [ -e "assets/${f##*/}" ]; then
+              # Two legs produced the same file name, so one would silently
+              # overwrite the other in the flat release namespace.
+              echo "::error::duplicate asset name ${f##*/}"
+              exit 1
+            fi
+            cp "${f}" assets/
+          done
+
+          n=$(find assets -type f | wc -l)
+          if [ "${n}" -ne 8 ]; then
+            echo "::error::expected 8 packages (2 per leg), found ${n}"
+            exit 1
+          fi
+
+          # Same format as `sha256sum`, so a user can save the file next to the
+          # downloads and run `sha256sum -c sha256sums.txt`.
+          (cd assets && sha256sum -- *.apk *.ipk > sha256sums.txt)
+          cat assets/sha256sums.txt
+
+      - name: Generate the release notes
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          HIGHLIGHTS: ${{ inputs.highlights }}
+        run: |
+          set -eu
+          sh scripts/release-notes.sh dist "${TAG}" > notes.md
+          cat notes.md >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -eu
+          # Creates the tag at this commit as a side effect; the tag was checked
+          # for existence in `prepare`, before any of the build time was spent.
+          gh release create "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "hermes-openwrt ${TAG}" \
+            --notes-file notes.md \
+            assets/*
+
+          url=$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json url -q .url)
+          echo "released: ${url}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "[${TAG}](${url})" >> "${GITHUB_STEP_SUMMARY}"

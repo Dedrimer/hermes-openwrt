@@ -33,6 +33,7 @@ for f in \
 	packages/luci-app-hermes-agent/files/hermes-chatd.init \
 	scripts/check-artifacts.sh \
 	scripts/check-sources.sh \
+	scripts/release-notes.sh \
 	scripts/sdk-trim-config.sh \
 	scripts/smoke/run.sh \
 	scripts/smoke/inner.sh \
@@ -85,6 +86,81 @@ do
 		sed 's/^/        /' "$tmp/err"
 	fi
 done
+
+# GitHub silently ignores a workflow it cannot parse: no run, no error, no hint
+# in the Actions tab. And a shell typo inside a `run:` block surfaces an hour
+# into an SDK build -- or, in the release workflow, in the last job after four
+# green build legs. Both are cheap to catch here.
+echo "== workflows"
+if python3 -c 'import yaml' 2>/dev/null; then
+	python3 - <<'PY' || fail=1
+import glob, pathlib, re, subprocess, sys, yaml
+
+ok = True
+
+
+def say(good, msg):
+    global ok
+    print(('  ok    ' if good else '  FAIL  ') + msg)
+    if not good:
+        ok = False
+
+
+files = sorted(glob.glob('.github/workflows/*.yml'))
+if not files:
+    say(False, 'no workflows found')
+
+for wf in files:
+    try:
+        doc = yaml.safe_load(open(wf))
+    except yaml.YAMLError as e:
+        say(False, '%s (%s)' % (wf, str(e).splitlines()[0]))
+        continue
+
+    # YAML 1.1 reads a bare `on:` key as the boolean True, so accept either form
+    # rather than depending on which spec version the loader follows.
+    if not doc.get(True, doc.get('on')) or not doc.get('jobs'):
+        say(False, '%s (no trigger or no jobs)' % wf)
+        continue
+
+    # Every `run:` block, parsed by the shell that will run it. GitHub
+    # expressions are textual substitution at run time, so replacing them with
+    # an inert word first is close to what bash actually ends up parsing.
+    blocks = 0
+    broken = 0
+    for job, spec in doc['jobs'].items():
+        for i, step in enumerate(spec.get('steps') or []):
+            if not step.get('run'):
+                continue
+            blocks += 1
+            src = re.sub(r'\$\{\{[^}]*\}\}', 'EXPR', step['run'])
+            shell = 'sh' if step.get('shell') in ('sh', 'dash') else 'bash'
+            p = subprocess.run([shell, '-n'], input=src, text=True,
+                               capture_output=True)
+            if p.returncode:
+                broken += 1
+                say(False, '%s / %s / %s\n        %s' %
+                    (wf, job, step.get('name', 'step %d' % (i + 1)),
+                     p.stderr.strip().replace('\n', '\n        ')))
+    if not broken:
+        plural = lambda n, w: '%d %s%s' % (n, w, '' if n == 1 else 's')
+        say(True, '%s (%s, %s)' % (wf, plural(len(doc['jobs']), 'job'),
+                                   plural(blocks, 'run block')))
+
+refs = sorted({m for wf in files
+               for m in re.findall(r'scripts/[A-Za-z0-9_./-]+\.(?:sh|py)',
+                                   open(wf).read())})
+missing = [r for r in refs if not pathlib.Path(r).is_file()]
+for r in missing:
+    say(False, 'workflows reference %s (missing)' % r)
+if refs and not missing:
+    say(True, '%d script references from workflows all resolve' % len(refs))
+
+sys.exit(0 if ok else 1)
+PY
+else
+	skip "PyYAML not installed -- workflows unchecked"
+fi
 
 # Every view named in menu.d must exist, and every ubus method the views call
 # must be granted by acl.d. Both mismatches produce a blank page with a console

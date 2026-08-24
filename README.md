@@ -120,6 +120,10 @@ init 脚本每次启动时生成到 `/var/run/hermes-agent.token`（0600），`h
 
 ## 构建与安装
 
+- 现成的包：[Releases](https://github.com/Dedrimer/hermes-openwrt/releases)——四种
+  目标组合各两个包，附 `sha256sums.txt` 和完整构建信息（每条腿用的 SDK 版本、Python
+  小版本、通过了哪几层验证）。发版由 `.github/workflows/release.yml` **手动**触发，
+  四条腿全绿才会创建 tag 和 release，见 [docs/BUILD.md](docs/BUILD.md) 六。
 - 本地 SDK 构建：[docs/BUILD.md](docs/BUILD.md)
 - 安装与首次配置：[docs/INSTALL.md](docs/INSTALL.md)
 - 移植决策、每个非显然选择的理由：[docs/PORTING.md](docs/PORTING.md)
