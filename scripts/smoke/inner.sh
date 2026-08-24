@@ -35,8 +35,8 @@ mkdir -p /var/run /var/lock /var/state /var/log
 # OpenWrt's stdlib gaps, no user site, and the compat directory carrying the
 # libc.musl-<arch>.so.1 soname the Alpine-built wheels ask for.
 #
-# Resolved on each call, not once at the top: the path does not exist until apk
-# has installed the package, and an empty PYTHONPATH here fails every dependency
+# Resolved on each call, not once at the top: the path does not exist until the
+# package is installed, and an empty PYTHONPATH here fails every dependency
 # check below for the wrong reason.
 site() { ls -d "$PREFIX"/lib/python*/site-packages 2>/dev/null | head -n1; }
 py() {
@@ -49,16 +49,67 @@ step "environment"
 echo "  $(. /etc/openwrt_release 2>/dev/null; echo "$DISTRIB_ID $DISTRIB_RELEASE $DISTRIB_ARCH")"
 echo "  loader: $(ls /lib/ld-musl-* 2>/dev/null | tr '\n' ' ')"
 
-step "apk install"
-apk update >/tmp/apk-update.log 2>&1 && ok "apk update" || {
-	bad "apk update"; tail -3 /tmp/apk-update.log | sed 's/^/        /'
-}
-if apk add --allow-untrusted /pkgs/*.apk >/tmp/apk.log 2>&1; then
-	ok "apk add ($(ls /pkgs | tr '\n' ' '))"
-	echo "  pulled: $(grep -cE '^\([0-9]+/[0-9]+\) Installing' /tmp/apk.log) packages"
+step "package install"
+# Which package manager depends on the release this rootfs came from, not on
+# anything we choose: 24.10 is opkg/.ipk, 25.12 is apk/.apk. Detect it from the
+# rootfs rather than deriving it from a version number -- that is one fewer
+# thing to update when a release changes generation.
+#
+# Note the globs cannot be shared: POSIX sh leaves an unmatched glob as the
+# literal string, so handing /pkgs/*.apk to opkg would ask it to install a file
+# named "*.apk" and the error would be about a missing file rather than about
+# the wrong tool.
+if command -v apk >/dev/null 2>&1; then
+	pm=apk
+elif command -v opkg >/dev/null 2>&1; then
+	pm=opkg
 else
-	bad "apk add"; tail -20 /tmp/apk.log | sed 's/^/        /'
+	pm=none
+	bad "no package manager found in the rootfs"
 fi
+
+case "$pm" in
+apk)
+	apk update >/tmp/pm-update.log 2>&1 && ok "apk update" || {
+		bad "apk update"; tail -3 /tmp/pm-update.log | sed 's/^/        /'
+	}
+	# Installing a file rather than a repository package is exactly what this
+	# test is for, and apk refuses it by default: without a package cache the
+	# file "would be lost on next reboot", so it wants --force-non-repository.
+	# On a router that warning is real; here the rootfs is thrown away after the
+	# run, so the objection does not apply.
+	#
+	# Probed rather than assumed. The flag does not exist in every apk build,
+	# and passing an unknown option turns a clear dependency error into a usage
+	# error -- which is a much worse thing to have to debug.
+	nonrepo=
+	apk add --help 2>&1 | grep -q -- '--force-non-repository' && \
+		nonrepo=--force-non-repository
+
+	if apk add --allow-untrusted $nonrepo /pkgs/*.apk >/tmp/pm.log 2>&1; then
+		ok "apk add ($(ls /pkgs | tr '\n' ' '))"
+		echo "  pulled: $(grep -cE '^\([0-9]+/[0-9]+\) Installing' /tmp/pm.log) packages"
+	else
+		bad "apk add"; tail -20 /tmp/pm.log | sed 's/^/        /'
+	fi
+	;;
+opkg)
+	opkg update >/tmp/pm-update.log 2>&1 && ok "opkg update" || {
+		bad "opkg update"; tail -3 /tmp/pm-update.log | sed 's/^/        /'
+	}
+	# opkg resolves dependencies from the feeds for a local file just as apk
+	# does, so this exercises the same DEPENDS closure. It has no
+	# --allow-untrusted: signature checking applies to the feed lists that
+	# `opkg update` fetched, and a file named on the command line is trusted by
+	# virtue of being named.
+	if opkg install /pkgs/*.ipk >/tmp/pm.log 2>&1; then
+		ok "opkg install ($(ls /pkgs | tr '\n' ' '))"
+		echo "  pulled: $(grep -cE '^(Installing|Configuring) ' /tmp/pm.log) packages"
+	else
+		bad "opkg install"; tail -20 /tmp/pm.log | sed 's/^/        /'
+	fi
+	;;
+esac
 
 step "files landed"
 for f in /usr/bin/hermes /usr/bin/hermes-agent /usr/sbin/hermes-chatd \
@@ -108,16 +159,31 @@ else
 fi
 
 step "stdlib gaps in OpenWrt's python3"
-# Informational, but it is the list to consult when a subcommand dies on an
-# import that "cannot possibly" be missing. msvcrt/winreg/nt/msvcrt are Windows
-# modules Hermes only imports inside platform-guarded blocks.
+# The missing list is informational -- it is what to consult when a subcommand
+# dies on an import that "cannot possibly" be missing. msvcrt/winreg/nt are
+# Windows modules Hermes only imports inside platform-guarded blocks.
+#
+# The shim assertion is not informational, and it is checked separately below
+# rather than inside the heredoc: this block is piped through sed, so its exit
+# status is sed's and a python traceback in here scrolls past as text while the
+# step counts zero failures. That is exactly what happened -- the one check that
+# proves files/shims/webbrowser.py is on PYTHONPATH could not fail.
 py - <<'PY' 2>&1 | sed 's/^/  /'
 import importlib.util, sys
 missing = [n for n in sorted(sys.stdlib_module_names)
            if not n.startswith('_') and importlib.util.find_spec(n) is None]
 print("missing: %s" % " ".join(missing))
-print("webbrowser resolves to: %s" % (importlib.util.find_spec("webbrowser").origin,))
 PY
+
+# Resolved through the wrapper's PYTHONPATH, so this proves the shim is both
+# installed and reachable -- the failure that took down every subcommand at once
+# when the package shipped without it.
+origin=$(py -c 'import importlib.util as u; s = u.find_spec("webbrowser"); print(s.origin if s else "")' 2>/dev/null)
+case "$origin" in
+	*/shims/webbrowser.py) ok "webbrowser resolves to the shim: $origin" ;;
+	"") bad "webbrowser does not resolve at all -- the shim is missing from the package" ;;
+	*) ok "webbrowser resolves to $origin (python3 ships it here)" ;;
+esac
 
 step "native extensions import"
 # The closure has exactly 13 non-pure wheels (deps.lock.json marks them
@@ -474,4 +540,25 @@ esac
 
 echo
 echo "FAILURES=$fail"
+
+# bwrap exits when its init -- this script -- exits, but only once nothing else
+# holds the sandbox open. ubusd and rpcd are started below and never reaped, and
+# `hermes serve` is exec'd by the wrapper so killing the subshell that launched
+# it leaves the gateway running. Any one of them keeps bwrap alive forever: the
+# run prints FAILURES= and then hangs, which in CI is a job that burns its whole
+# timeout instead of failing in seconds. Killing the process group is enough --
+# everything here is in this script's group, and PID 1 of a PID namespace exiting
+# takes the rest with it anyway.
+kill_leftovers() {
+	for p in ${chatd_pid:-} ${serve_pid:-}; do
+		kill "$p" 2>/dev/null || :
+	done
+	# Names, not pids: hermes serve is a grandchild we never recorded, and the
+	# wrapper's exec means its pid is not the one we backgrounded.
+	killall hermes rpcd ubusd 2>/dev/null || :
+	sleep 1
+	killall -9 hermes rpcd ubusd 2>/dev/null || :
+}
+kill_leftovers
+
 exit "$fail"

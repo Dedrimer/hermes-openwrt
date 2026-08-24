@@ -106,7 +106,16 @@ if [ -z "$name" ]; then
 	# Listed rather than guessed: the file is openwrt-<ver>-x86-64-rootfs.tar.gz,
 	# with the target's dashes, not the SDK's underscores, and the naming has
 	# changed between releases before.
-	name=$(curl -fsSL "$base/" | grep -oE 'openwrt-[^"<]*-rootfs\.tar\.gz' | head -n1)
+	#
+	# 25.12 lists two rootfs tarballs for x86/64 -- the plain name and
+	# <...>-generic-targz-rootfs.tar.gz -- so `head -n1` picked whichever the
+	# server happened to list first and the harness silently changed what it
+	# tested between runs. Prefer the plain name, which is the one 24.10 also
+	# publishes, so the same rule holds across both generations; fall back to
+	# whatever is on offer if a future release drops it.
+	listing=$(curl -fsSL "$base/" | grep -oE 'openwrt-[^"<]*-rootfs\.tar\.gz' | sort -u)
+	name=$(echo "$listing" | grep -E "^openwrt-[^-]*-$board-$subtarget-rootfs\.tar\.gz$" | head -n1)
+	[ -n "$name" ] || name=$(echo "$listing" | head -n1)
 	[ -n "$name" ] || { echo "no rootfs tarball listed at $base/" >&2; exit 1; }
 	echo "  fetching $name"
 	curl -fsSL "$base/$name" -o "$work/$name"
@@ -122,8 +131,8 @@ tar -xzf "$work/$name" -C "$rootfs" 2>"$work/untar.log" || true
 
 # OpenWrt ships /etc/resolv.conf as a symlink to /tmp/resolv.conf, which netifd
 # would write at boot. Nothing boots here, so the link is bound to the host's
-# resolver -- apk needs to resolve downloads.openwrt.org for the dependency
-# closure (python3, luci-base, rpcd-mod-ucode ...).
+# resolver -- the package manager needs to resolve downloads.openwrt.org for the
+# dependency closure (python3, luci-base, rpcd-mod-ucode ...).
 echo "== sandbox"
 exec bwrap \
 	--unshare-user --uid 0 --gid 0 \

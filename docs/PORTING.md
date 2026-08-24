@@ -86,6 +86,22 @@ shim 只实现被用到的 `open()`（11 处）和 `get()`（2 处），行为�
 的标准库缺口」。全量缺口列表（3.13 上 10 个）里，Hermes 另外引用到的只有 `msvcrt`
 和 `winreg`，两个都只出现在缩进过的 Windows 分支里，永远不会执行，所以不用管。
 
+冒烟测试现在直接断言 `webbrowser` **解析到我们这个文件**
+（`importlib.util.find_spec("webbrowser").origin` 以 `/shims/webbrowser.py` 结尾），
+而不是只打印一份缺口清单。原来那一版是这么写的：
+
+```sh
+py - <<'PY' 2>&1 | sed 's/^/  /'
+...
+print("webbrowser resolves to: %s" % (importlib.util.find_spec("webbrowser").origin,))
+PY
+```
+
+shim 真的不在的时候，`find_spec()` 返回 `None`，`.origin` 抛 `AttributeError`——而
+整段是 `| sed`，退出码是 sed 的，于是**唯一能证明 shim 生效的那项检查，自己失败了却
+一项都不计**，traceback 混在正常输出里滚过去。这和 §7 第 4 条、以及 SDK 裁剪那次
+`warning` 是同一个毛病：**断言必须能让整跑变红**，否则它只是一行注释。
+
 ## 2. 依赖：从 33 个包到 0 个包
 
 **旧方案（已废弃）**：把每个 Python 依赖做成一个 `python3-*` OpenWrt 包，官方 feed
@@ -341,11 +357,39 @@ ucode 全局函数真的存在（§7 第 2 条那个 bug 的静态版本）。�
 两个包，逐条核对 Makefile 承诺的文件真的在里面——**少一行 `$(INSTALL_BIN)` 不会让
 构建失败，只会装出一个「能装、但什么都没有」的包**，这是这个项目最容易掉进去的坑。
 
-第三个是运行期冒烟测试：把两个 `.apk` 装进一份真的 OpenWrt x86_64 rootfs，在
+第三个是运行期冒烟测试：把两个包装进一份真的 OpenWrt x86_64 rootfs，在
 bubblewrap 沙箱里用**目标自己的 musl 和 python3** 跑起来。它覆盖的是前两层原理上
 看不到的东西——wheel 能不能在 OpenWrt 的 musl 下加载、rpcd 认不认这个 ucode 插件、
 网关和桥的 websocket 握手到底能不能成。`webbrowser` 那个 bug（§1）就是它抓的：包
 是完整的、文件一个不少、`hermes --version` 也正常，但任何一条子命令都跑不起来。
+
+**装包这一步要按 rootfs 探测工具**：24.10 是 opkg/`.ipk`，25.12 是 apk/`.apk`，
+两代不通用。`apk` 还要 `--force-non-repository`——它默认拒绝装「不属于任何仓库」的
+文件，理由是没有 package cache 的话重启就没了。在路由器上这个警告是对的，在跑完就
+删的沙箱里不适用。这个 flag 是**探测**出来的（`apk add --help` 里 grep），不是写死
+的：传一个不认识的选项，会把一条清楚的依赖错误变成 usage 错误，那个方向更难查。
+
+三条已经付过学费的经验，都写在脚本注释里：
+
+1. **两个包管理器的 glob 不能合写**。POSIX sh 对匹配不上的 glob 保留字面量，把
+   `/pkgs/*.apk` 喂给 opkg，它报的是「没有 `*.apk` 这个文件」，而不是「你用错工具
+   了」——排查方向直接被带偏。
+2. **rootfs 的文件名要挑确定的那个**。25.12 的 x86/64 同时挂着
+   `openwrt-<ver>-x86-64-rootfs.tar.gz` 和 `...-generic-targz-rootfs.tar.gz` 两个
+   包，原来的 `head -n1` 取服务器先列的那个，于是**同一个脚本在两次运行之间悄悄换了
+   被测对象**，而日志里只有一行文件名的差别。现在固定优先取不带变体名的那个（24.10
+   也发这个名字，一条规则跨两代都成立）。
+3. **跑完要把后台进程杀干净**。`ubusd`/`rpcd` 是后台起的且从来没人回收，`hermes
+   serve` 又是被 wrapper `exec` 掉的（杀那个子 shell 的 pid 杀不到它）。只要还剩一个
+   活着，bwrap 就不退出：`FAILURES=0` 打完之后整跑一直挂着，在 CI 里表现为把 job 的
+   超时烧光，而不是几秒钟内失败。
+
+还有一条**跟这一层本身无关、但坑了一下午**的：**验证陈旧产物等于没验证**。24.10
+那条腿一度报 7 个失败，其中 4 个是 `settings_set` 把 `.env` 写成 `null`（§7 第 4 条
+那个已经修过的 bug），1 个是 `rand()`，1 个是 `webbrowser` 找不到 shim——全都是**几
+小时前的 `.ipk`**，源码早修好了，`bin/` 里的包没重建。`PKG_RELEASE` 帮着看破了这件
+事（源码树是 `r2`，装进去的是 `r1`），所以**日志头上那行包文件名要当证据读**，它是
+唯一能区分「代码有 bug」和「你在测昨天的代码」的东西。
 
 沙箱选 bwrap 不是偏好：这台构建机上非特权 `unshare -rm` 里 `/proc`、`/sys`、`/dev`
 一个都挂不上（分别是 EPERM 和 EINVAL），bwrap 干的就是这件事。它只能测 x86_64，

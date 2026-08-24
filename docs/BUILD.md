@@ -264,20 +264,33 @@ sh scripts/smoke/run.sh ~/hermes-build/sdk/sdk-25.12-x86_64
 
 它做的事：取和 SDK 同一个 release 的官方 x86_64 rootfs（版本从 SDK 自己的
 `CONFIG_VERSION_REPO` 读，所以 libc / python 小版本 / 包管理器代次都对得上），
-每次**重新解开**一份，在 bubblewrap 沙箱里 `apk add` 刚构建的两个包，然后按顺序
+每次**重新解开**一份，在 bubblewrap 沙箱里装上刚构建的两个包，然后按顺序
 验证：文件与权限、musl soname 软链、`hermes --version`、`hermes --help`（这一步才
-会构造完整 parser，也就是导入所有子命令）、闭包里 13 个原生扩展逐个能否加载、
+会构造完整 parser，也就是导入所有子命令）、`webbrowser` 解析到我们的 shim、
+闭包里 13 个原生扩展逐个能否加载、
 `.dist-info` 数量、`ucode -c` 编译 rpcd 插件、`ubusd`+`rpcd` 起来之后
 `ubus call luci.hermes-agent {status,settings_get,logs}`、init 脚本对非回环
 `host` 的拒绝，最后拉起 `hermes serve` 与 `hermes-chatd` 验证 `/api/ws` 握手，
 并从 ubus 侧走一遍 `chat_send` → 网关 → `chat_poll` 的完整往返。
 退出码就是失败项数。
 
+**装包用哪个工具是探测出来的，不是算出来的**：24.10 是 opkg/`.ipk`，25.12 是
+apk/`.apk`，脚本 `command -v apk || command -v opkg` 看 rootfs 里有什么就用什么。
+两条分支的 glob 不能合写——POSIX sh 对匹配不上的 glob 保留字面量，把 `/pkgs/*.apk`
+喂给 opkg，报的错会是「没有这个文件」而不是「工具不对」，方向就带偏了。
+opkg 没有 `--allow-untrusted`：签名校验只作用于 `opkg update` 取回来的 feed 列表，
+命令行上点名的文件本身就是可信的。
+
 沙箱里 `logd` 起不来（要读 `/proc/kmsg`，`setgid()` 在只映射一个 uid 的用户命名空间
 里返回 EINVAL），所以 `logread` 是空的：`logs` 那个 ubus 方法只验通路不验内容，
 而检查 init 脚本 `logger` 输出的那一步用 PATH 顶一个 `logger` stub。
 ucode 方法里抛出的异常在 ubus 调用方只显示 `Unknown error`，真正的消息在 rpcd 的
 stderr 里，所以聊天那几步失败时会自动把 `/tmp/rpcd.log` 打出来。
+
+跑完会 `killall hermes rpcd ubusd`。这不是礼貌问题：`ubusd`/`rpcd` 是后台起的、
+从来没人回收，而 `hermes serve` 是被 wrapper `exec` 掉的，杀那个子 shell 的 pid
+杀不到它。只要还有一个活着，bwrap 就不退出——`FAILURES=0` 打完之后整跑一直挂着，
+在 CI 里就是把 job 的超时烧光，而不是几秒钟内失败。
 
 第一次会下 ~250 MB 的 rootfs 压缩包（缓存在工作目录里，默认
 `/tmp/hermes-smoke`，可用第二个参数指定），整跑一次三到五分钟。
