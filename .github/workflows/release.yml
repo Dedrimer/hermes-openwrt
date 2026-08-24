@@ -138,13 +138,55 @@ jobs:
       # generated file and the next upgrade would silently revert it. Shipping a
       # release whose dependency set nobody can reproduce is worse than not
       # shipping one.
-      - name: Verify the dependency lock matches the pinned upstream commit
+      - name: Read the pinned upstream commit
+        id: pin
         run: |
           set -eu
           ref="$(sed -n 's/^PKG_SOURCE_VERSION:=\(.*\)$/\1/p' packages/hermes-agent/Makefile)"
-          test -n "${ref}"
+          # Insist on a full commit sha. A tag or branch there would build
+          # something different tomorrow, and would also make the HEAD
+          # comparison two steps down meaningless.
+          case ${ref} in
+            *[!0-9a-f]*) bad=1 ;;
+            *) [ ${#ref} -eq 40 ] || bad=1 ;;
+          esac
+          if [ -n "${bad:-}" ]; then
+            echo "::error::PKG_SOURCE_VERSION must be a full 40-char commit sha, got '${ref}'"
+            exit 1
+          fi
           echo "pinned upstream commit: ${ref}"
-          python3 scripts/sync-deps.py --ref "${ref}" --check
+          echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
+
+      # sync-deps.py can clone upstream itself (--ref), and that is what a human
+      # runs. On a runner it is the wrong move twice over: it mirrors the full
+      # history to read two files, and it does so anonymously -- and anonymous
+      # git over HTTPS is rate-limited per source IP, an IP this runner shares
+      # with the entire Actions fleet. That is what killed the first release
+      # attempt: HTTP 429 on a clone that works fine from a laptop.
+      # actions/checkout authenticates with this workflow's token and fetches
+      # one commit, so --source gets the same tree for a fraction of the traffic.
+      - name: Check out upstream at the pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ steps.pin.outputs.ref }}
+          path: upstream
+          persist-credentials: false
+
+      - name: Verify the dependency lock matches the pinned upstream commit
+        env:
+          REF: ${{ steps.pin.outputs.ref }}
+        run: |
+          set -eu
+          # Were the checkout above ever to hand us a different commit, the
+          # --check below would report "generated files are out of date" and send
+          # the reader after a hand-edit that never happened.
+          have="$(git -C upstream rev-parse HEAD)"
+          if [ "${have}" != "${REF}" ]; then
+            echo "::error::upstream checkout is at ${have}, expected ${REF}"
+            exit 1
+          fi
+          python3 scripts/sync-deps.py --source upstream --check
 
   build:
     name: ${{ matrix.release }} ${{ matrix.name }} (${{ matrix.fmt }})
@@ -243,6 +285,21 @@ jobs:
           echo "selected: $(grep -c '^CONFIG_PACKAGE_.*=[ym]' .config) packages, $(grep -c '^CONFIG_PACKAGE_kmod.*=[ym]' .config) kmods"
           grep -E '^CONFIG_PACKAGE_(hermes-agent|luci-app-hermes-agent)=' .config
           grep -hE '^CONFIG_(ARCH|TARGET_ARCH_PACKAGES)=' .config
+
+      # PKG_SOURCE_PROTO:=git means the SDK clones hermes-agent itself, and it
+      # would do it anonymously from an IP shared by the whole Actions fleet --
+      # the same rate limit that failed the lint job, except here it surfaces
+      # after the toolchain has already been built. Rewriting github.com traffic
+      # to carry this workflow's token puts the clone under a per-token limit
+      # instead. Wheels come from files.pythonhosted.org and are unaffected.
+      - name: Authenticate git for the SDK's source fetch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          git config --global \
+            "url.https://x-access-token:${GH_TOKEN}@github.com/.insteadOf" \
+            https://github.com/
 
       - name: Build hermes-agent
         working-directory: sdk

@@ -36,6 +36,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -299,19 +300,61 @@ def render_mk(var: str, wheels: list[Resolved], title: str) -> str:
     return "".join(out)
 
 
+def mirror(repo: Path) -> None:
+    """Clone the upstream mirror, tolerating GitHub's anonymous rate limit.
+
+    Anonymous git over HTTPS is throttled per source IP, so any shared address
+    -- a CI runner, an office NAT -- can be told HTTP 429 for a clone that works
+    fine from a laptop. Retrying usually wins; when it does not, the useful
+    answer is not a CalledProcessError traceback but the way around it.
+    """
+    delay = 5
+    for attempt in (1, 2, 3):
+        print(f"[sync] mirroring {UPSTREAM_URL}"
+              + (f" (attempt {attempt})" if attempt > 1 else ""))
+        if subprocess.run(
+            ["git", "clone", "--mirror", "--quiet", UPSTREAM_URL, str(repo)]
+        ).returncode == 0:
+            return
+        # A failed clone leaves a partial directory that would be mistaken for a
+        # warm cache on the next run.
+        shutil.rmtree(repo, ignore_errors=True)
+        if attempt < 3:
+            print(f"[sync] clone failed; retrying in {delay}s")
+            time.sleep(delay)
+            delay *= 3
+
+    sys.exit(
+        f"error: could not clone {UPSTREAM_URL}\n"
+        "       If git reported 429, it was rate-limited rather than refused:\n"
+        "       anonymous traffic is throttled per source IP. Either retry later,\n"
+        "       or check the commit out some other way and pass --source instead\n"
+        "       of --ref (this is what CI does, via actions/checkout)."
+    )
+
+
 def checkout(ref: str, cache: Path) -> Path:
     repo = cache / "hermes-agent.git"
     cache.mkdir(parents=True, exist_ok=True)
     if not repo.exists():
-        print(f"[sync] mirroring {UPSTREAM_URL}")
-        subprocess.run(
-            ["git", "clone", "--mirror", "--quiet", UPSTREAM_URL, str(repo)], check=True
-        )
+        mirror(repo)
     else:
         print("[sync] fetching upstream")
         subprocess.run(
             ["git", "-C", str(repo), "fetch", "--all", "--tags", "--quiet"], check=False
         )
+
+    # A warm cache plus a fetch that failed is the confusing case: the checkout
+    # below would report "pathspec did not match", which reads like a bad ref.
+    if subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+        stdout=subprocess.DEVNULL,
+    ).returncode:
+        sys.exit(
+            f"error: {ref} is not in the mirror cache at {repo}\n"
+            "       the fetch above did not bring it in -- network, or a bad ref"
+        )
+
     work = cache / "worktree"
     if work.exists():
         shutil.rmtree(work)
@@ -328,6 +371,12 @@ def checkout(ref: str, cache: Path) -> Path:
 
 
 def main() -> int:
+    # Every child process here writes straight to fd 2, so a block-buffered
+    # stdout would flush our progress lines after their own error output --
+    # which is how a CI log comes to show git's 429 *before* the line saying
+    # what was being cloned.
+    sys.stdout.reconfigure(line_buffering=True)
+
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ref", help="upstream git ref (tag/branch/commit) to sync from")

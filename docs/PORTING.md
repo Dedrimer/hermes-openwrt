@@ -101,9 +101,27 @@ shim 只实现被用到的 `open()`（11 处）和 `get()`（2 处），行为�
 没有任何手工维护的依赖表，版本与上游锁文件逐字一致。
 
 ```sh
-python3 scripts/sync-deps.py --ref v0.21.0          # 重新生成
-python3 scripts/sync-deps.py --ref <commit> --check  # CI：校验没人手改过生成物
+python3 scripts/sync-deps.py --ref v0.21.0             # 重新生成
+python3 scripts/sync-deps.py --source ../hermes-agent --check   # 校验没人手改过生成物
 ```
+
+`--ref` 会自己去 clone 上游（缓存在 `~/.cache/hermes-openwrt`，可用
+`HERMES_SYNC_CACHE` 改），`--source` 用一份已有的 checkout。脚本只需要
+`pyproject.toml`、`uv.lock` 和 `git rev-parse HEAD` 三样东西，所以浅 clone 够用。
+
+**CI 里必须用 `--source`。** 第一次发版就是死在这儿：GitHub 对**匿名** git over
+HTTPS 按来源 IP 限流，而 runner 的出口 IP 是整个 Actions 机群共用的，于是在笔记本上
+好好的 `git clone` 在 runner 上直接 `HTTP 429`。现在 workflow 用
+`actions/checkout` 取上游——带着本次运行的 token、只取 pin 的那一个 commit——再把目录
+喂给 `--source`。同理，`PKG_SOURCE_PROTO:=git` 意味着**SDK 自己也会 clone 上游**，
+那一次发生在工具链已经编完之后，所以构建腿在编译前会先
+`git config --global url.https://x-access-token:$TOKEN@github.com/.insteadOf`，把
+github.com 的流量挪到按 token 计的额度上。wheel 来自 files.pythonhosted.org，不受
+影响。
+
+`--ref` 这条路也加了退避重试（5s、15s，共三次），失败时报错会直接点明「这可能是限流，
+可以改用 `--source`」而不是抛一个 `CalledProcessError` 栈；缓存里那份半成品目录会在
+每次重试前删掉，否则下一次运行会把它当成热缓存。
 
 代价是这些包不与系统共享（装两份 pyyaml），换来的是「上游测过的组合」和「升级
 成本趋近于零」。在一个装了 Hermes 就没别的 Python 应用的路由器上，这个交换很划算。

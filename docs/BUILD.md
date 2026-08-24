@@ -300,6 +300,27 @@ pin 的上游 commit 重新解析依赖，核对 `deps/*.mk` 没被手改过）�
 的是唯一一层真的**执行**目标代码的验证。aarch64 那两条腿跑不了：沙箱里跑的是目标
 真二进制。
 
+### runner 上的 git 都要带 token
+
+两个 workflow 里凡是会 clone github.com 的地方，都必须走认证。**匿名** git over
+HTTPS 是按来源 IP 限流的，而 runner 的出口 IP 属于整个 Actions 机群，所以在笔记本上
+一次成功的 clone 到了 runner 上会直接吃 `HTTP 429`。这吃过一次亏：第一次发版死在
+`lint` 里，`sync-deps.py --ref` 自己去 clone 上游被限流。踩点有两处，都已处理：
+
+- `lint`：先从 Makefile 读出 pin 的 commit（顺手断言它是 40 位全 sha——写成 tag 或
+  分支的话，明天构建出来的就是另一个东西），用 `actions/checkout` 取上游到
+  `upstream/`（带本次运行的 token，只取那一个 commit），再 `--source upstream --check`。
+  checkout 之后会核对 `git -C upstream rev-parse HEAD` 等于那个 pin，否则 `--check`
+  只会报「生成物过期」，把人引向一个根本不存在的手改。
+- `build` ×4：`PKG_SOURCE_PROTO:=git` 意味着 **SDK 自己也要 clone 上游**，而且发生在
+  工具链已经编完之后。所以编译前先
+  `git config --global url.https://x-access-token:$TOKEN@github.com/.insteadOf`，
+  把 github.com 的流量挪到按 token 计的额度上。wheel 走 files.pythonhosted.org，
+  不受影响。
+
+本地手工升级仍然用 `--ref`，它自己 clone；限流时会退避重试三次，最终失败的报错里直接
+写着「可以改用 `--source`」。
+
 ### 发版：`.github/workflows/release.yml`（只能手动触发）
 
 Actions → **release** → Run workflow。没有任何 push 会触发它——发版是一个决定，不是
