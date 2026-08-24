@@ -280,23 +280,33 @@ Overview（状态 + 启停 + 日志尾巴）、Chat、Settings。
 
 这几条在 [BUILD.md](BUILD.md) 里有操作说明，这里只记结论：
 
-- **SDK 的包选择要同时改两个地方，改一个等于没改。** SDK 出厂就选中了全部 6683 个
+- **SDK 的包选择要同时改三个地方，改两个等于没改。** SDK 出厂就选中了全部 6683 个
   包（1084 个 kmod、188 个 firmware、rockchip 上 35 个 u-boot）。
   `Config-build.in` 把每个包符号声明成没有 prompt 的形式，kconfig 对不可见符号一律
-  忽略用户值——所以 `.config` 里的 `=n`、`# ... is not set`、删行、`CONFIG_ALL=n`
-  全都会被下一次 `make defconfig` 还原（三种方式独立验证过）。但 feed 里的包在
+  忽略用户值——所以 `.config` 里的 `=n`、`# ... is not set`、删行全都会被下一次
+  `make defconfig` 还原（三种方式独立验证过）。但 feed 里的包在
   `tmp/.config-package.in` 里**另有一份带 prompt 的声明**，带 prompt 的符号 kconfig
-  是尊重 `.config` 旧值的，而出厂 `.config` 里它们全是 `=m`。于是正确的做法是
-  「改 `Config-build.in` 的 default + 删掉 `.config` 里的 `CONFIG_PACKAGE_*` 行」
-  两步一起做，`scripts/sdk-trim-config.sh` 就是这个（留 `.pristine` 备份，
-  之后 6683 → 64 个包，正好是我们的依赖闭包）。
+  是尊重 `.config` 旧值的，而出厂 `.config` 里它们全是 `=m`。第三处最阴：那份声明写的
+  是 `default m if ALL||ALL_NONSHARED`，而这三个 `ALL*` 开关**在 SDK 自己的
+  `Config.in` 里还有一份带 prompt 的声明**（`config ALL` / `default y`），所以它们也只能
+  在 `.config` 里关，改 `Config-build.in` 里那三段是彻底的空操作。
+  `scripts/sdk-trim-config.sh` 三步一起做（留 `.pristine` 备份，之后 6683 → 64 个包，
+  正好是我们的依赖闭包）。
+- **「在我机器上是好的」的标准形态。** 上面第三处漏了将近一整个项目周期都没暴露，
+  因为构建机上那个用了很久的 SDK，它的 `.config` 里早就有
+  `# CONFIG_ALL is not set`（某次 menuconfig 留下的），裁剪脚本一直交出 64 个包。
+  而**全新解开的 SDK** 没有 `.config`，`ALL` 取默认值 `y`，同一个脚本交出 9832 个包和
+  186 个 kmod——CI 上永远是后者。教训不是「要在干净环境验」这句空话，而是：验证脚本的
+  断言必须是**硬失败**。这条断言当时只是 `warning`，于是它在每一次绿色的 CI 里都如实
+  警告过，没有任何人和任何机器看见。
 - **只裁一半比不裁更糟。** `Config-build.in` 里**一条 `select` 都没有**（0 条，
-  对比 `tmp/.config-package.in` 的 777 条），所以内核模块的依赖闭包在那份声明里根本
+  对比 `tmp/.config-package.in` 的 24268 条），所以内核模块的依赖闭包在那份声明里根本
   不存在。只把 kmod 的 default 改成 `n` 会留下一个部分选中的集合：`comgt-ncm` 选中
   `kmod-usb-serial-option`，没人选中它要的 `kmod-usb-serial-wwan`，四十分钟后
   `package/kernel/linux` 在打包阶段报 `missing dependencies … usb_wwan.ko`。
   四条腿里有三条是这么死的，剩下那条（25.12/x86_64）纯属运气。自洽状态只有全选或
-  全不选，脚本走全不选并在 defconfig 之后断言 kmod 计数为 0。
+  全不选，脚本走全不选并在 defconfig 之后断言 kmod / firmware / u-boot 三项都是 0，
+  不为 0 就退出非零。
 - **`make` 会对所有已选中的包跑 prereq。** 于是 rockchip 上
   `uboot-rockchip` 缺 host `swig` / `python3-pyelftools` 就能让整个 feed 构建在开始
   之前失败。裁掉 u-boot 或装上那两个 host 包，二者其一（CI 里两样都做了）。

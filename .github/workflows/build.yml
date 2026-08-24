@@ -175,7 +175,8 @@ jobs:
           mkdir -p sdk
           url='${{ steps.sdk.outputs.url }}'
           curl -fsSL "${url}" -o "sdk.tar.${url##*.}"
-          # 24.10 ships .tar.xz, 25.12 switched to .tar.zst.
+          # Both extensions are live: 25.12 moved to .tar.zst, and 24.10 has
+          # followed since 24.10.8, so do not assume either from the release.
           case "${url}" in
             *.zst) tar --zstd -xf sdk.tar.zst --strip-components=1 -C sdk ;;
             *)     tar -xJf sdk.tar.xz --strip-components=1 -C sdk ;;
@@ -186,25 +187,50 @@ jobs:
         working-directory: sdk
         run: |
           set -eu
+          # Three things about this that are easy to get wrong, all of them
+          # learned the hard way on a real runner:
+          #
+          # 1. The feed name has to match /^\w+$/. scripts/feeds parses
+          #    feeds.conf with `^src-([\w-]+)(flags)\s+(\w+)...`, so a hyphen in
+          #    the *name* is a hard "Syntax error in feeds.conf, line 1" (exit
+          #    25) -- which is exactly what `hermes-openwrt` got. `hermes` is
+          #    also the name the build machine uses, so bin/packages/<arch>/hermes/
+          #    is the same path locally and here.
+          # 2. An SDK ships feeds.conf.default and *no* feeds.conf, and
+          #    scripts/feeds prefers feeds.conf whenever it exists. Appending to
+          #    a file that is not there yet therefore creates a config listing
+          #    only our feed and silently unconfigures base/packages/luci --
+          #    after which nothing can install luci-base. Seed from the default.
+          # 3. There is no `feeds src-link` subcommand (list/install/search/
+          #    uninstall/update/clean is the whole set), so the call that used to
+          #    be here only ever printed its usage into the log and fell through.
+          test -f feeds.conf || cp feeds.conf.default feeds.conf
+          grep -q '^src-link hermes ' feeds.conf ||
+            echo "src-link hermes ${GITHUB_WORKSPACE}/packages" >> feeds.conf
+          cat feeds.conf
+
           ./scripts/feeds update -a
-          ./scripts/feeds src-link hermes-openwrt "${GITHUB_WORKSPACE}/packages" 2>/dev/null || \
-            echo "src-link hermes-openwrt ${GITHUB_WORKSPACE}/packages" >> feeds.conf
-          ./scripts/feeds update hermes-openwrt
           ./scripts/feeds install -a
+          test -d package/feeds/hermes || { echo "::error::hermes feed did not install"; exit 1; }
 
           # An SDK arrives with all 6683 packages of every feed selected: 1084
           # kernel modules, 188 firmware blobs and (on rockchip) 35 u-boot
           # variants. Building one feed package then compiles that universe as
           # collateral, and `make` runs every selected package's prereq first.
           #
-          # This cannot be fixed from .config alone -- the generated
-          # Config-build.in declares those symbols without a prompt, so kconfig
-          # ignores user values and defconfig reverts them -- nor from
-          # Config-build.in alone, because feed packages are declared a second
-          # time *with* a prompt in tmp/.config-package.in and keep their =m
-          # from the shipped .config. The script does both, runs defconfig, and
-          # asserts the result (64 packages, 0 kmods). See the comment in it for
-          # why a partial kmod selection is worse than no trim at all.
+          # Three things hold that selection in place and the script undoes all
+          # three: promptless `default m` in Config-build.in (kconfig ignores
+          # user values for invisible symbols, so .config edits get reverted),
+          # a second *prompted* declaration of every feed package in
+          # tmp/.config-package.in (which keeps its =m from .config), and
+          # `default m if ALL||ALL_NONSHARED` on those -- where ALL is itself
+          # prompted, in the SDK's own Config.in, with `default y`. That last
+          # one only bites on a freshly extracted SDK, i.e. always here and
+          # never on a developer's long-lived one. The script asserts its own
+          # result now, and fails rather than warns: our two packages selected,
+          # and 0 kmods / 0 firmware / 0 u-boot (which leaves ~64 packages, 63
+          # on 25.12 -- the closure is asserted by name, not by count). See the
+          # comment in it for why a partial kmod selection is worse than no trim.
           sh "${GITHUB_WORKSPACE}/scripts/sdk-trim-config.sh" .
 
           echo "selected: $(grep -c '^CONFIG_PACKAGE_.*=[ym]' .config) packages, $(grep -c '^CONFIG_PACKAGE_kmod.*=[ym]' .config) kmods"

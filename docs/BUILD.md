@@ -49,25 +49,56 @@ RK3528 属于 `rockchip/armv8`（`aarch64_generic`），用上面第二/第四�
 
 ```sh
 cd sdk
+
+# feed 名只能是 [A-Za-z0-9_]，见下面「feed 名里不能有连字符」
+test -f feeds.conf || cp feeds.conf.default feeds.conf
+grep -q '^src-link hermes ' feeds.conf ||
+	echo "src-link hermes /path/to/hermes-openwrt/packages" >> feeds.conf
+
 ./scripts/feeds update -a
-./scripts/feeds src-link hermes-openwrt /path/to/hermes-openwrt/packages
-./scripts/feeds update hermes-openwrt
 ./scripts/feeds install -a
 
 # 关键一步：裁掉 SDK 自带的全量包选择，并 make defconfig（理由见下一节）
 sh /path/to/hermes-openwrt/scripts/sdk-trim-config.sh .
 ```
 
-脚本跑完会打印前后对比，24.10/rockchip 上是这样：
+### feed 名里不能有连字符
+
+`scripts/feeds` 解析 `feeds.conf` 的正则是：
+
+```perl
+m!^src-([\w\-]+)((?:\s+--\w+(?:=\S+)?)*)\s+(\w+)(?:\s+(\S.*))?$!
+```
+
+**类型**可以带连字符（`[\w\-]+`，所以有 `src-git-full`），**feed 名却是 `(\w+)`**。
+写成 `hermes-openwrt` 会直接 `Syntax error in feeds.conf, line 1` 并 `die`（exit 25），
+而且报错只说行号不说原因。这在 CI 上真的发生过。所以名字用 `hermes`——顺带一提，
+feed 名就是产物目录名，所以本地和 CI 的 `bin/packages/<arch>/hermes/` 是同一个路径。
+
+另外两点同样要紧：
+
+- **没有 `feeds src-link` 这个子命令**（全集是 list / install / search / uninstall /
+  update / clean）。写了也只会把 usage 打进日志然后往下走，看起来像成功了。挂本地
+  目录的正确做法就是往 `feeds.conf` 里写一行 `src-link <名> <绝对路径>`。
+- **SDK 里只有 `feeds.conf.default`，没有 `feeds.conf`**，而 `scripts/feeds` 一旦发现
+  `feeds.conf` 就只认它。所以直接 `>> feeds.conf` 会造出一个只有我们这一条的配置，
+  base/packages/luci 全部消失（`./scripts/feeds list -n` 只剩 `hermes`），之后
+  `luci-base` 无从安装。必须先从 `.default` 拷一份。
+
+脚本跑完会打印前后对比。已经 `make defconfig` 过一次的 SDK 上是这样：
 
 ```
   before     packages:6683   kmod:1084   firmware:188  u-boot:35
   after      packages:64     kmod:0      firmware:0    u-boot:0
 ```
 
+刚解开、还没有 `.config` 的 SDK 上 `before` 那行会是 `(no .config yet)`，`after`
+一样是 64 / 0 / 0 / 0（在 24.10/x86_64 上逐字比对过：和构建机上那个用了很久的 SDK
+选出来的 64 个包**完全一致**）。
+
 `after` 那 64 个包就是我们两个包的依赖闭包（python3 全家、luci-base、
 rpcd-mod-ucode、libopenssl…），一个不多。脚本自己会 `make defconfig` 并校验我们
-两个包确实 `=m`，所以不需要再手工追加 `CONFIG_PACKAGE_…=m`。
+两个包确实 `=m`，所以不需要再手工追加 `CONFIG_PACKAGE_…=m`。重复跑是幂等的。
 
 ### SDK 会替你选中整个世界
 
@@ -100,26 +131,61 @@ config PACKAGE_kmod-aoe
 
 kconfig 对不可见符号一律忽略用户值，只取 default。所以 `.config` 里写
 `CONFIG_PACKAGE_kmod-aoe=n`、写 `# CONFIG_PACKAGE_kmod-aoe is not set`、或者把整行
-删掉，下一次 `make defconfig` 都会原样恢复；`CONFIG_ALL=n`、`CONFIG_ALL_KMODS=n`、
-`CONFIG_ALL_NONSHARED=n` 同样无效（这三个符号在 SDK 里也是 promptless 的）。
+删掉，下一次 `make defconfig` 都会原样恢复。
 
-**但只改 `Config-build.in` 也不够。** feed 里的包在 `tmp/.config-package.in` 里
-**另有一份带 prompt 的声明**，而带 prompt 的符号 kconfig 是尊重 `.config` 里的旧值
-的——SDK 出厂的 `.config` 里它们全是 `=m`。所以两件事都要做，缺一个都像是脚本没生效：
+**但只改 `Config-build.in` 也不够**，而且不够的地方有两处。
 
-1. `Config-build.in`：所有 `PACKAGE_*` 以及 `ALL` / `ALL_KMODS` / `ALL_NONSHARED`
-   的 `default y|m` 改成 `default n`（留 `Config-build.in.pristine` 备份，
-   `--restore` 可回滚）；
+第一处：feed 里的包在 `tmp/.config-package.in` 里**另有一份带 prompt 的声明**，而带
+prompt 的符号 kconfig 是尊重 `.config` 里的旧值的——SDK 出厂的 `.config` 里它们全是
+`=m`。（两份声明谁的 `default` 生效取决于解析顺序：`Config.in` 先 `source
+"Config-build.in"` 再 `source "tmp/.config-package.in"`，同一符号第一条匹配的
+`default` 胜出，所以 base 包由前者决定。）
+
+第二处，也是**排查最久的一处**：那 10905 个带 prompt 的符号写的是
+
+```
+	config PACKAGE_block-mount
+		tristate "block-mount..........."
+		default y if DEFAULT_block-mount
+		default m if ALL||ALL_NONSHARED
+		select PACKAGE_libblobmsg-json
+		...
+```
+
+而 `ALL` / `ALL_KMODS` / `ALL_NONSHARED` 这三个开关，在 SDK **自己的 `Config.in`**
+里（不是生成的 `Config-build.in`）还有第二份声明，**是带 prompt 的**：
+
+```
+	config ALL
+		bool "Select all userspace packages by default"
+		default y
+```
+
+也就是说这三个符号根本不是 promptless 的，改 `Config-build.in` 里那三段**完全无效**，
+必须在 `.config` 里关掉。这个 bug 藏了很久，因为一个用过一段时间的 SDK 的 `.config`
+里通常已经有 `# CONFIG_ALL is not set` 了（早年某次 menuconfig 留下的），裁剪脚本
+看起来一直好好的；而**全新解开的 SDK**——CI 上永远是这种——`ALL` 默认 `y`，裁完还剩
+9832 个包和 186 个内核模块，正好落进下面「只裁 kmod 比不裁更糟」那个坑。
+
+所以三件事都要做，缺一个都像是脚本没生效：
+
+1. `Config-build.in`：所有 `PACKAGE_*` 的 `default y|m` 改成 `default n`
+   （留 `Config-build.in.pristine` 备份，`--restore` 可回滚）；
 2. `.config`：删掉所有 `CONFIG_PACKAGE_*` 行（其余的 target / arch / toolchain
-   设置必须原样保留），只写回我们两个包。
+   设置必须原样保留），只写回我们两个包；
+3. `.config`：写上三行 `# CONFIG_ALL is not set` / `# CONFIG_ALL_KMODS is not set` /
+   `# CONFIG_ALL_NONSHARED is not set`。
 
-`scripts/sdk-trim-config.sh` 做的就是这两步 + `make defconfig`。
+`scripts/sdk-trim-config.sh` 做的就是这三步 + `make defconfig`，并在最后**硬断言**
+kmod / firmware / u-boot 三项计数都是 0（以前只是 warning，于是它在每一次「绿色」的
+CI 里都老老实实警告过，而 CI 照样把内核模块全编了一遍）。它在没有 `.config` 的全新
+SDK 上也能跑：`.config` 缺的部分 kconfig 会从 `Config-build.in` 的 default 里补齐。
 
 #### 只裁 kmod 比不裁更糟
 
 这是本项目踩过的最贵的一个坑：只做上面第 1 步会得到一个**部分选中**的 kmod 集合，
 而 `Config-build.in` 里**一条 `select` 都没有**（0 条，对比
-`tmp/.config-package.in` 里的 777 条），kconfig 因此完全无法推导内核模块的依赖闭包。
+`tmp/.config-package.in` 里的 24268 条），kconfig 因此完全无法推导内核模块的依赖闭包。
 于是 `comgt-ncm` 选中了 `kmod-usb-serial-option`，没人选中它需要的
 `kmod-usb-serial-wwan`，四十分钟后 `package/kernel/linux` 在打包阶段炸掉：
 
@@ -131,8 +197,9 @@ ERROR: package/kernel/linux failed to build.
 ```
 
 自洽的状态只有两个：kmod 全选（上游一致，但慢），或者 kmod 一个都不选。脚本走后者，
-并在 `make defconfig` 之后断言 kmod 计数为 0，不为 0 就当场警告——比四十分钟后再
-发现便宜得多。
+并在 `make defconfig` 之后断言 kmod / firmware / u-boot 三项计数都是 0，**不为 0 就
+直接退出非零**——比四十分钟后再发现便宜得多。这一条以前只是打印 warning，代价是它在
+CI 里警告了无数次而没人看见，构建照旧把内核模块全编了一遍。
 
 ## 三、构建
 
@@ -145,8 +212,8 @@ make package/luci-app-hermes-agent/compile V=s -j"$(nproc)"
 
 | OpenWrt | 路径 | 文件名 |
 | --- | --- | --- |
-| 25.12 | `bin/packages/<arch>/hermes-openwrt/` | `hermes-agent-<ver>-r<rel>.apk` |
-| 24.10 | `bin/packages/<arch>/hermes-openwrt/` | `hermes-agent_<ver>-r<rel>_<arch>.ipk` |
+| 25.12 | `bin/packages/<arch>/hermes/` | `hermes-agent-<ver>-r<rel>.apk` |
+| 24.10 | `bin/packages/<arch>/hermes/` | `hermes-agent_<ver>-r<rel>_<arch>.ipk` |
 
 注意两种格式的分隔符不同（`-` 与 `_`）——写脚本匹配产物时别只写一种，
 `scripts/check-artifacts.sh` 里的 glob 是 `hermes-agent[-_][0-9]*`。
@@ -355,7 +422,7 @@ luci-app-hermes-agent_0.20.5-r2_openwrt-24.10_aarch64_generic.ipk
 
 ```sh
 d=$(mktemp -d); mkdir "$d/leg"
-cp sdk/bin/packages/*/hermes-openwrt/*.apk "$d/leg/"
+cp sdk/bin/packages/*/hermes/*.apk "$d/leg/"
 printf 'release=25.12\narch=x86_64\nfmt=apk\nsdk_version=25.12.5\npython=3.13\nartifacts_check=pass\nsmoke=pass\n' \
 	> "$d/leg/build-info.env"
 sh scripts/release-notes.sh "$d" v0.0.0-test | less

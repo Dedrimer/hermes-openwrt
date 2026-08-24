@@ -16,7 +16,7 @@
 #
 #     d=$(mktemp -d)
 #     mkdir "$d/leg"
-#     cp sdk/bin/packages/*/hermes-openwrt/*.apk "$d/leg/"
+#     cp sdk/bin/packages/*/hermes/*.apk "$d/leg/"
 #     printf 'release=25.12\narch=x86_64\nfmt=apk\nsdk_version=25.12.5\npython=3.13\n' \
 #         > "$d/leg/build-info.env"
 #     sh scripts/release-notes.sh "$d" v0.0.0-test | less
