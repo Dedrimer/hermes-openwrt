@@ -127,6 +127,9 @@ function readEnv() {
 // Rewrite .env applying `sets` (key -> value) and `clears` (list of keys).
 // Untouched lines, including comments and keys outside the whitelist, survive
 // in their original order and spelling.
+//
+// Returns null on success or an error message. The readback at the end is not
+// paranoia -- see the comment there.
 function writeEnv(sets, clears) {
 	let seen = {};
 	let kept = [];
@@ -162,14 +165,34 @@ function writeEnv(sets, clears) {
 			push(kept, `${key}=${sets[key]}`);
 	}
 
-	if (!writefile(ENV_FILE, join(kept, '\n') + '\n'))
-		return false;
+	// join() takes the SEPARATOR FIRST in ucode. The reversed form returns null
+	// instead of throwing, `null + '\n'` stringifies to "null\n", and
+	// writefile() then reports a happy 5 bytes written -- so the reversed call
+	// silently replaced this file with the text "null" and still answered
+	// "saved". That shipped once; hence the readback below.
+	if (!writefile(ENV_FILE, join('\n', kept) + '\n'))
+		return 'failed to write ' + ENV_FILE;
 
 	// writefile() creates with the umask; secrets must not be group/world
 	// readable even for the one tick before postinst-style fixups.
 	exec('chmod 0600 ' + shellquote(ENV_FILE));
 
-	return true;
+	// Parse the file back and assert every requested change is actually in it.
+	// This is the only check that catches a serialization bug: every individual
+	// step above can succeed while the resulting file means something else, and
+	// the file holds the user's API keys -- silently losing them and reporting
+	// success is the worst outcome available here.
+	let back = readEnv();
+
+	for (let key in sets)
+		if (back[key] != sets[key])
+			return `${ENV_FILE} did not keep ${key} (wrote it, read back something else)`;
+
+	for (let i = 0; i < length(clears); i++)
+		if (exists(back, clears[i]))
+			return `${ENV_FILE} still contains ${clears[i]} after clearing it`;
+
+	return null;
 }
 
 function uciServe() {
@@ -448,8 +471,12 @@ const methods = {
 				}
 			}
 
-			if (dirty && !writeEnv(sets, clears))
-				return { ok: false, error: 'failed to write ' + ENV_FILE };
+			if (dirty) {
+				let err = writeEnv(sets, clears);
+
+				if (err)
+					return { ok: false, error: err };
+			}
 
 			return { ok: true };
 		}

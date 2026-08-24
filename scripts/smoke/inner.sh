@@ -235,6 +235,83 @@ else
 	tail -5 /tmp/rpcd.log | sed 's/^/        /'
 fi
 
+# The Settings page writes API keys through this method, so "it returned ok" is
+# not enough: the file has to actually say what the user typed. That distinction
+# is not academic -- `join(array, sep)` (ucode wants the separator first) returns
+# null instead of throwing, so the whole file was once replaced with the four
+# bytes "null" while every call still answered {"ok":true}. Only reading the file
+# back catches that, which is exactly what this step does.
+step "settings_set really edits .env"
+if ubus list 2>/dev/null | grep -qx 'luci.hermes-agent'; then
+	# A line outside the whitelist must survive every edit, untouched.
+	printf 'CUSTOM_KEEP_ME=1\n' >> /srv/hermes/.env
+
+	out=$(ubus call luci.hermes-agent settings_set \
+		'{"env_set":{"OPENAI_API_KEY":"sk-smoke-set-1","OPENAI_BASE_URL":"http://127.0.0.1:1/v1"}}' 2>&1)
+	if echo "$out" | grep -q '"ok": *true'; then
+		ok "settings_set reported success"
+	else
+		bad "settings_set: $(echo "$out" | tr -s '\n\t ' ' ' | cut -c1-200)"
+		tail -10 /tmp/rpcd.log | sed 's/^/        /'
+	fi
+
+	if grep -qx 'OPENAI_API_KEY=sk-smoke-set-1' /srv/hermes/.env 2>/dev/null; then
+		ok ".env contains the value that was written"
+	else
+		bad ".env does NOT contain the written value"
+		sed 's/^/        /' /srv/hermes/.env
+	fi
+
+	grep -qx 'CUSTOM_KEEP_ME=1' /srv/hermes/.env 2>/dev/null \
+		&& ok "a line outside the whitelist survived the rewrite" \
+		|| bad "the rewrite dropped CUSTOM_KEEP_ME=1"
+
+	mode=$(ls -l /srv/hermes/.env | awk '{print $1}')
+	case "$mode" in
+		-rw-------) ok ".env is still $mode after the rewrite" ;;
+		*) bad ".env mode is $mode, expected -rw-------" ;;
+	esac
+
+	# Write-only secrets: the presence flag may come back, the value may not.
+	out=$(ubus call luci.hermes-agent settings_get 2>&1)
+	echo "$out" | tr -d ' \t\n' | grep -q '"OPENAI_API_KEY":true' \
+		&& ok "settings_get reports the key as present" \
+		|| bad "settings_get does not see the key: $(echo "$out" | tr -s '\n\t ' ' ' | cut -c1-200)"
+	case "$out" in
+		*sk-smoke-set-1*) bad "settings_get echoed the key material back" ;;
+		*) ok "settings_get never returns key material" ;;
+	esac
+
+	# A newline in a value would smuggle a second assignment into the file.
+	out=$(ubus call luci.hermes-agent settings_set '{"env_set":{"NOUS_API_KEY":"a
+B=2"}}' 2>&1)
+	case "$out" in
+		*newline*) ok "a value containing a newline is refused" ;;
+		*) bad "newline injection was NOT refused: $(echo "$out" | tr -s '\n\t ' ' ' | cut -c1-160)" ;;
+	esac
+
+	out=$(ubus call luci.hermes-agent settings_set '{"env_set":{"PATH":"/tmp"}}' 2>&1)
+	case "$out" in
+		*'not editable'*) ok "a key outside the whitelist is refused" ;;
+		*) bad "PATH was NOT refused: $(echo "$out" | tr -s '\n\t ' ' ' | cut -c1-160)" ;;
+	esac
+
+	# Clearing must remove the key and keep everything else. The gateway step
+	# further down re-adds a key of its own, so leaving it cleared is fine.
+	out=$(ubus call luci.hermes-agent settings_set '{"env_clear":["OPENAI_API_KEY"]}' 2>&1)
+	if echo "$out" | grep -q '"ok": *true' && ! grep -q '^OPENAI_API_KEY=' /srv/hermes/.env; then
+		ok "env_clear removed the key"
+	else
+		bad "env_clear: $(echo "$out" | tr -s '\n\t ' ' ' | cut -c1-160)"
+		sed 's/^/        /' /srv/hermes/.env
+	fi
+	grep -qx 'CUSTOM_KEEP_ME=1' /srv/hermes/.env 2>/dev/null \
+		&& ok "the foreign line survived the clear too" \
+		|| bad "env_clear dropped CUSTOM_KEEP_ME=1"
+else
+	bad "settings_set not tested: the ubus object is missing"
+fi
+
 step "init scripts parse"
 for s in hermes-agent hermes-chatd; do
 	sh -n /etc/init.d/$s 2>/tmp/e && ok "sh -n /etc/init.d/$s" || {

@@ -10,7 +10,9 @@
 | `luci-app-hermes-agent` | 想用网页界面就装 | `luci-base`、`rpcd-mod-ucode`、`hermes-agent` |
 
 Python 依赖闭包在 `hermes-agent` 包内部（私有 site-packages），**没有**一堆
-`python3-xxx` 包要装。装完约 60–90 MB，小 flash 设备请先做 extroot 或挂 USB。
+`python3-xxx` 包要装。两个包自己约 164 MB，加上 python3 等依赖闭包，实测在
+OpenWrt 25.12.5 x86_64 上整机占用从 23 MB 涨到 226 MB——**准备 300 MB 以上的可写
+空间**，小 flash 设备请先做 extroot 或挂 USB。
 
 依赖里的 `python3`、`luci-base`、`rpcd-mod-ucode` 都来自官方源，所以路由器能上网
 时先 `update` 一次，剩下的交给包管理器解析：

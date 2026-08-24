@@ -232,7 +232,7 @@ Overview（状态 + 启停 + 日志尾巴）、Chat、Settings。
 `logread` 多点一次菜单不值得。这也是从旧版本删掉 `logs.js` 的原因——
 `check-artifacts.sh` 现在专门断言它**没有**从脏的 `PKG_BUILD_DIR` 里复活。
 
-### ucode 的三个坑
+### ucode 的四个坑
 
 1. `for (let x in array)` 拿到的是**值**不是下标，和 JavaScript 相反。插件里一律用
    显式下标循环，避免写出一个静默失效的白名单检查。
@@ -248,6 +248,15 @@ Overview（状态 + 启停 + 日志尾巴）、Chat、Settings。
 3. **`ucode -T` 不是语法检查。** `-T` 的意思是「把输入当模板处理」，于是 `{% %}`
    之外的内容全是字面文本——喂给它一个纯垃圾文件也会原样打印并 `exit 0`。本仓库的
    静态检查一度用的就是它，等于什么都没查。编译检查是 `ucode -c -o /dev/null`。
+4. **`join()` 是分隔符在前，写反了不报错。** `join(array, sep)` 返回 `null`，
+   `null + '\n'` 字符串化成 `"null\n"`，`writefile()` 于是「成功写入 5 字节」并返回
+   真值。一条写反了的 `join` 把用户的 `/srv/hermes/.env` 整个替换成四个字节
+   `null`，而 Settings 页从头到尾回的都是 `{"ok":true}`。这一串里没有任何一步失败，
+   所以任何「检查每一步的返回值」的写法都抓不到它：能抓到的只有**把文件读回来断言
+   自己写的东西真的在里面**，这就是 `writeEnv()` 末尾那段回读。教训不只是参数顺序：
+   凡是「写完就报成功」的路径，如果写的是用户不可重建的数据（API key），就必须回读。
+   这个 bug 前三层验证全绿（连补了 `settings_set` 覆盖之前的冒烟测试也是绿的，因为
+   它从来没调过这个方法），是 §10 第四层——QEMU 里真的登录一次 LuCI——抓到的。
 
 ## 8. 构建基础设施：三个吃掉一下午的坑
 
@@ -289,12 +298,13 @@ apk workflow 断言 `hermes-agent_*.apk`，那个条件永远不可能成立。
 
 ## 10. 怎么验证改动没坏
 
-三层，越往下越慢，但抓到的东西也越靠后：
+四层，越往下越慢，但抓到的东西也越靠后：
 
 ```sh
 sh scripts/check-sources.sh                  # 几秒，不需要 SDK
 sh scripts/check-artifacts.sh <sdk-dir>      # 构建后，解包核对
 sh scripts/smoke/run.sh <sdk-dir>            # 真 rootfs 里跑起来
+sh scripts/vm/run.sh <sdk-dir>               # QEMU 里真的装一遍、真的登录一次
 ```
 
 第一个脚本交叉验证四件只有在真机上才会暴露的事：菜单指向的视图文件存在、视图调用
@@ -327,3 +337,39 @@ bwrap 起不来，而且报的错跟我们的包一点关系都没有。
 没有这个包，于是 CI 的第一层会退回 node 近似检查，ucode 全局探测也就跳过了。真正
 执行这项检查的地方是冒烟测试——那里的 rootfs 一定有 ucode 二进制，而且探的是**已
 安装**的插件。这个分工是故意的，别指望 lint job 抓到 `rand()` 那类问题。
+
+### 第四层：QEMU 里的真机替身
+
+第三层跑的是目标的真二进制，但它没有内核、没有 procd、没有 uhttpd、也没有 rpcd 的
+ACL。第四层把这些补上：`scripts/vm/run.sh` 下载官方 kernel + ext4 rootfs，把镜像
+撑到 2 GB，注入 root 口令 / ssh 公钥 / 一份让 br-lan 走 DHCP 的 `rc.local`，启动
+QEMU，`apk add` 装两个包（**其余依赖从官方 feed 解析**），起服务，然后
+`scripts/vm/luci-check.sh` 用 curl 走完浏览器那条路：POST 登录拿 `sysauth_*`
+cookie，用它当 ubus session id 调 `/ubus/`，逐个验三个视图的 JS 资源、三个页面的
+dispatcher、七个方法、`settings_set` 的真实落盘、聊天往返，最后断言
+`file.exec` 被 ACL 拒绝、`shell.exec` 被插件白名单拒绝、登出后 session 立刻失效。
+在这台构建机上从零到 26 项全绿约两分钟。
+
+三个「为什么」值得记下来：
+
+- **全程不需要 root。** qemu 从一个解包到 `$HOME` 的 Arch 包里跑（`QEMU=` 指过去，
+  它按二进制的相对路径找 `../lib/qemu`、`../share/qemu`）；`/dev/kvm` 只要组权限；
+  改 rootfs 用 `debugfs -w -f`（`write` + `sif mode|uid|gid`）而不是 `mount`——
+  挂载要 root 和 loop 设备，debugfs 在用户态改 ext4，还能把写进去的文件设成 root
+  拥有的 0600，这才是非特权账号能塞进一份 `/etc/shadow` 的原因。`sif mode` 写的是
+  整个 `i_mode`，**类型位要带上**（普通文件 `0100600`，目录 `040755`），只写 `0600`
+  会得到一个类型为 0 的文件，然后被 fsck「修好」。
+- **用 kernel + ext4-rootfs，不用 combined 镜像。** combined 是带分区表和 syslinux
+  的整盘镜像，要么动 `sfdisk` 扩分区，要么忍受出厂那 104 MB 的根文件系统——而装完
+  要 226 MB。直接在命令行上给 QEMU 一个 kernel，rootfs 镜像就是整块磁盘，
+  `resize2fs` 一条命令解决。virtio 也是必须的：这份内核内建 virtio_blk/net/pci，
+  而 e1000 是模块，没有 initramfs 加载不了，症状是 panic 在「找不到根设备」。
+- **每条 guest 命令都要 `ssh -n`。** 不加 `-n` 的话，内层 ssh 会继承脚本自己的
+  stdin，把剩下的脚本吃掉——于是脚本静默地提前结束，还报成功。这个坑在这个项目里
+  踩过两次（另一次是 `... | head && echo OK`）。
+
+第四层不是锦上添花：`join()` 那个 bug（§7 第 4 条）在前三层全绿的情况下，被真实
+登录后的头几分钟抓到了，因为前三层从来没有人调用过 `settings_set`。现在冒烟测试
+补了 `settings_set` 的往返断言（写进去的值真的在文件里、白名单外的行不动、模式还是
+0600、值不回显、换行注入被拒），第四层再从浏览器那条路走一遍同样的事。CI 暂时不跑
+第四层（需要嵌套虚拟化或者忍受 TCG 的速度），它是发版前在构建机上手动跑的一层。

@@ -35,7 +35,9 @@ for f in \
 	scripts/check-sources.sh \
 	scripts/sdk-trim-config.sh \
 	scripts/smoke/run.sh \
-	scripts/smoke/inner.sh
+	scripts/smoke/inner.sh \
+	scripts/vm/run.sh \
+	scripts/vm/luci-check.sh
 do
 	[ -f "$f" ] || { bad "$f (missing)"; continue; }
 

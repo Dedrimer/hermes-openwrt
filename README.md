@@ -148,10 +148,25 @@ websocket 握手和 `chat_send` → 网关 → `chat_poll` 的往返（需要 `b
 sh scripts/smoke/run.sh /path/to/openwrt-sdk-…
 ```
 
+最上面一层是真机测试的替身：QEMU 里起一份真的 OpenWrt，`apk add` 装包（依赖从
+官方 feed 解析），然后**用浏览器走的那条路**——登录拿 session cookie、经 uhttpd 和
+rpcd ACL 调 `/ubus/`——把三个页面和七个方法过一遍。全程不需要 root：
+
+```sh
+sh scripts/vm/run.sh /path/to/openwrt-sdk-…
+```
+
+这一层不是锦上添花。前三层全绿的时候，它在真实登录后的几分钟内抓出了 Settings 页
+静默丢弃 API key 的 bug（见 [docs/PORTING.md](docs/PORTING.md) §7），因为前三层
+从来没有人调用过 `settings_set`。
+
 ## 已知取舍
 
-- **体积**：装完约 60–90 MB（含依赖闭包与 bundled 资源），建议 extroot / USB /
-  x86 软路由。`optional-skills`（约 9 MB）默认不装，menuconfig 里可开。
+- **体积**：两个包自己约 164 MB（`/usr/lib/hermes-agent` 146 MB 私有
+  site-packages + `/usr/share/hermes-agent` 18 MB bundled 资源）；加上 python3
+  等依赖闭包，实测在 OpenWrt 25.12.5 x86_64 上整机占用从 23 MB 涨到 226 MB。
+  也就是说**准备 300 MB 以上的可写空间**，建议 extroot / USB / x86 软路由。
+  `optional-skills`（约 9 MB）默认不装，menuconfig 里可开。
 - **交互式终端 UI 不包含**：那是一个 Node/TypeScript 应用，与"跟着上游快速升级"
   的目标冲突。用 LuCI 的 Chat 页。
 - musllinux wheel 是在 Alpine 上构建的，部分 `.so` 的 `DT_NEEDED` 指向

@@ -8,9 +8,11 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-hermes-agent
 PKG_VERSION:=0.20.5
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
-# Version-tracked with the hermes-agent package it manages.
+# Version-tracked with the hermes-agent package it manages; PKG_RELEASE moves on
+# its own for packaging fixes (r2: the Settings page silently discarded API keys,
+# see docs/PORTING.md §7).
 
 PKG_LICENSE:=Apache-2.0
 PKG_MAINTAINER:=hermes-openwrt feed <https://github.com/hermes-openwrt>

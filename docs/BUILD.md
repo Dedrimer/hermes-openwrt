@@ -212,6 +212,62 @@ stderr 里，所以聊天那几步失败时会自动把 `/tmp/rpcd.log` 打出�
 `unshare -rm` 挂不上 `/proc`、`/sys`、`/dev`，所以不能用 chroot 凑），并且只能测
 x86_64 SDK——沙箱里跑的是目标的真二进制，aarch64 在 x86 上执行不了。
 
+### QEMU 安装测试（真内核、真 procd、真 LuCI 会话）
+
+冒烟测试没有内核、没有 procd、没有 uhttpd，也没有 rpcd 的 ACL。这一层把这些补上：
+
+```sh
+sh scripts/vm/run.sh ~/hermes-build/sdk/sdk-25.12-x86_64
+```
+
+它下载官方 kernel + `ext4-rootfs.img.gz`（版本同样从 SDK 的 `CONFIG_VERSION_REPO`
+读），把镜像撑到 2 GB，用 `debugfs` 注入 root 口令、ssh 公钥和一份让 br-lan 走 DHCP
+的 `rc.local`，启动 QEMU，把两个包 `cat` 进 guest 后 `apk add --allow-untrusted`
+（**其余依赖从官方 feed 解析**——这正是它能证明 `DEPENDS` 写对了的原因），打开
+`serve.enabled`、起服务、等网关和桥连上，最后调用 `scripts/vm/luci-check.sh`：
+
+```sh
+sh scripts/vm/luci-check.sh http://127.0.0.1:8080 hermes-vm   # 也可以单独跑
+```
+
+`luci-check.sh` 走的是浏览器那条路，不是 `ubus call`：POST 登录拿 `sysauth_*`
+cookie，拿它当 ubus session id 打 `/ubus/`，验三个视图的 JS 资源、三个页面的
+dispatcher、菜单项、七个方法、`settings_set` 的真实落盘与「不该动的行没动」、聊天
+往返，再断言 `file.exec` 被 ACL 拒（`"result":[6]`）、`shell.exec` 被插件白名单拒、
+登出后 session 立刻失效。退出码是失败项数，当前 26 项。
+
+跑完 VM 默认**留着**，方便真的用浏览器点一遍（`VM_KEEP=0` 则跑完关机）：
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `QEMU` | PATH 里的 `qemu-system-x86_64` | 见下面的免 root 装法 |
+| `VM_PASSWORD` | `hermes-vm` | guest 的 root 口令，LuCI 也用它 |
+| `VM_SSH_PORT` / `VM_HTTP_PORT` | 2222 / 8080 | 宿主侧端口 |
+| `VM_HTTP_BIND` | `127.0.0.1` | 想从别的机器开浏览器看才改成 `0.0.0.0`——guest 的 root 口令是已知的 |
+| `VM_DISK` / `VM_MEM` / `VM_CPUS` | 2G / 2048 / 4 | 装完要 226 MB，2G 够 |
+| `VM_KEEP` | 1 | 0 = 跑完关机 |
+
+**不需要 root。** 这台构建机上的 qemu 是把 Arch 的 `.pkg.tar.zst` 解到
+`~/hermes-build/vm/prefix` 得到的——qemu 按二进制的相对路径找 `../lib/qemu`、
+`../share/qemu`，所以解包即可用；`/dev/kvm` 只要组权限（没有就退回 TCG，只是慢）。
+`LD_LIBRARY_PATH` 别全局导出，否则 curl / ssh / e2fsprogs 也会去那个 prefix 里取
+glib 和 openssl；包一层脚本再用 `QEMU=` 指过去：
+
+```sh
+cat > ~/hermes-build/vm/qemu-wrap.sh <<'EOF'
+#!/bin/sh
+P=~/hermes-build/vm/prefix
+LD_LIBRARY_PATH=$P/usr/lib exec "$P/usr/bin/qemu-system-x86_64" "$@"
+EOF
+chmod +x ~/hermes-build/vm/qemu-wrap.sh
+QEMU=~/hermes-build/vm/qemu-wrap.sh sh scripts/vm/run.sh ~/hermes-build/sdk/sdk-25.12-x86_64
+```
+
+从零到 26 项全绿约两分钟（其中 `apk add` 一分多钟）。出问题先看工作目录（默认
+`/tmp/hermes-vm`）里的 `serial.log`（内核和 procd 的全部输出）与 `apk.log`；
+guest 里 `logread -e hermes` 是第二站。CI 不跑这一层——它要嵌套虚拟化，
+或者忍受 TCG 的速度——这是发版前手动跑的一层。
+
 ## 五、离线 / 受限网络
 
 ```sh
