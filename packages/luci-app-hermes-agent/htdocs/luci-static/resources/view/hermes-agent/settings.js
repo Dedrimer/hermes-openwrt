@@ -91,11 +91,19 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.option(form.ListValue, 'log_level', _('Log level'));
-		o.value('debug', 'debug');
-		o.value('info', 'info');
-		o.value('warning', 'warning');
-		o.value('error', 'error');
+		o.value('debug', _('Debug'));
+		o.value('info', _('Info'));
+		o.value('warning', _('Warning'));
+		o.value('error', _('Error'));
 		o.default = 'info';
+
+		o = s.option(form.Flag, 'remember_session', _('Remember chat session'),
+			_('Restore the most recent Hermes session and its history when the terminal is opened again.'));
+		o.default = '1';
+		o.rmempty = false;
+
+		o = s.option(form.DummyValue, '_remembered_session', _('Remembered session ID'));
+		o.cfgvalue = () => st.remembered_session || _('No session has been saved yet.');
 
 		o = s.option(form.Value, 'workdir', _('Workspace directory'),
 			_('Where the agent reads and writes files when a task involves them.'));

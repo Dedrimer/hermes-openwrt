@@ -29,6 +29,9 @@ const HERMES_HOME = '/srv/hermes';
 const ENV_FILE = HERMES_HOME + '/.env';
 const CONFIG_FILE = HERMES_HOME + '/config.yaml';
 const CONFIG_MAX = 65536;
+const LOG_CACHE = '/tmp/hermes-agent.log-cache';
+const LOG_CACHE_MAX_AGE = 300;
+const CHAT_SESSION_FILE = HERMES_HOME + '/.luci-session';
 
 // Chat bridge IPC. hermes-chatd owns the websocket; these files are the whole
 // interface between it and the browser. See /usr/sbin/hermes-chatd for why the
@@ -207,6 +210,18 @@ function uciServe() {
 	};
 }
 
+function cachedLogs(lines) {
+	let data = readfile(LOG_CACHE) ?? '';
+	let all = filter(split(trim(data), '\n'), l => l != '');
+	let first = length(all) > lines ? length(all) - lines : 0;
+	let out = [];
+
+	for (let i = first; i < length(all); i++)
+		push(out, all[i]);
+
+	return out;
+}
+
 // --- chat bridge helpers ---------------------------------------------------
 
 function chatState() {
@@ -359,24 +374,40 @@ const methods = {
 	},
 
 	logs: {
-		args: { lines: 0, pattern: '' },
+		args: { lines: 0, pattern: '', refresh: false },
 		call: function(request) {
 			let a = request.args ?? {};
 			let lines = 200;
-			let pattern = 'hermes';
 
 			if (type(a.lines) == 'int' && a.lines > 0 && a.lines <= 1000)
 				lines = a.lines;
 
-			if (type(a.pattern) == 'string' && a.pattern != '' && length(a.pattern) <= 200)
-				pattern = a.pattern;
+			// The cache is deliberately fixed to the Hermes syslog tag. Keeping the
+			// RPC argument preserves compatibility with older callers without
+			// allowing arbitrary cache files or shell arguments.
+			if (a.refresh == true) {
+				let r = exec('/usr/sbin/hermes-log-cache --wait');
 
-			let r = exec('logread -l ' + lines + ' -e ' + shellquote(pattern));
+				return {
+					code: r.code,
+					lines: cachedLogs(lines),
+					cached_at: stat(LOG_CACHE)?.mtime ?? 0,
+					updating: false
+				};
+			}
 
-			if (r.code != 0)
-				return { code: r.code, lines: [] };
+			let st = stat(LOG_CACHE);
+			let stale = (st == null || (time() - (st.mtime ?? 0)) >= LOG_CACHE_MAX_AGE);
 
-			return { code: 0, lines: filter(split(trim(r.output), '\n'), l => l != '') };
+			if (stale)
+				exec('/usr/sbin/hermes-log-cache >/dev/null 2>&1 &');
+
+			return {
+				code: 0,
+				lines: cachedLogs(lines),
+				cached_at: st?.mtime ?? 0,
+				updating: stale
+			};
 		}
 	},
 
@@ -404,7 +435,8 @@ const methods = {
 				env: visible,
 				config: readfile(CONFIG_FILE) ?? '',
 				config_size: st?.size ?? 0,
-				keys: ENV_KEYS
+				keys: ENV_KEYS,
+				remembered_session: trim(readfile(CHAT_SESSION_FILE) ?? '')
 			};
 		}
 	},
@@ -550,6 +582,32 @@ const methods = {
 		}
 	},
 
+	// Persist only the opaque Hermes session id, never the gateway token. Keep it
+	// outside UCI so recording a new session cannot trigger a service reload.
+	session_remember: {
+		args: { session_id: '' },
+		call: function(request) {
+			let sid = request.args?.session_id ?? '';
+
+			if (type(sid) != 'string' || !match(sid, /^[A-Za-z0-9_.:-]{0,128}$/))
+				return { ok: false, error: 'invalid session id' };
+
+			let c = cursor();
+			let enabled = (c.get('hermes-agent', 'serve', 'remember_session') ?? '1') == '1';
+
+			if (enabled && sid != '') {
+				if (!writefile(CHAT_SESSION_FILE, sid + '\n'))
+					return { ok: false, error: 'failed to save the session id' };
+
+				exec('chmod 0600 ' + shellquote(CHAT_SESSION_FILE));
+			} else {
+				unlink(CHAT_SESSION_FILE);
+			}
+
+			return { ok: true, remembered: enabled && sid != '' };
+		}
+	},
+
 	// Incremental read of the event log.
 	//
 	// The caller keeps two numbers: `gen` and `offset`. Passing them back gets
@@ -566,11 +624,24 @@ const methods = {
 		call: function(request) {
 			let a = request.args ?? {};
 			let st = chatState();
+			let remembered = '';
+			let remember = false;
+
+			// Only the initial tail request needs configuration state. Avoid opening
+			// a UCI cursor on every one-second event poll.
+			if (a.tail == true) {
+				let c = cursor();
+
+				remember = (c.get('hermes-agent', 'serve', 'remember_session') ?? '1') == '1';
+				remembered = remember ? trim(readfile(CHAT_SESSION_FILE) ?? '') : '';
+			}
 
 			if (!st)
 				return {
 					gen: 0, offset: 0, lines: [], resync: true, running: false,
 					connected: false,
+					remember_session: remember,
+					remembered_session: remembered,
 					error: 'the chat bridge is not running (start hermes-chatd)'
 				};
 
@@ -607,6 +678,8 @@ const methods = {
 				connected: (st.connected == true),
 				error: st.error ?? '',
 				active_session: st.active_session ?? '',
+				remember_session: remember,
+				remembered_session: remembered,
 				gateway: st.gateway ?? ''
 			};
 		}

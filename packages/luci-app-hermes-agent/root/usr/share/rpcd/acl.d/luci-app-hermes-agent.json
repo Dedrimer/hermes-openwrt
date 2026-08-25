@@ -10,7 +10,7 @@
 		},
 		"write": {
 			"ubus": {
-				"luci.hermes-agent": [ "action", "settings_set", "chat_send" ]
+				"luci.hermes-agent": [ "action", "settings_set", "chat_send", "session_remember" ]
 			},
 			"uci": [ "hermes-agent" ]
 		}

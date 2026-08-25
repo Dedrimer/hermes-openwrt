@@ -186,6 +186,25 @@ case $out in
 	*) bad "PATH was NOT refused: $(printf '%s' "$out" | cut1)" ;;
 esac
 
+step "remembered chat session, browser path"
+out=$(rpc luci.hermes-agent session_remember '{"session_id":"luci-check-session-1"}')
+case $out in
+	*'"ok":true'*) ok "session_remember accepted a session id" ;;
+	*) bad "session_remember -> $(printf '%s' "$out" | cut1 200)" ;;
+esac
+
+out=$(rpc luci.hermes-agent settings_get '{}')
+case $out in
+	*'"remembered_session":"luci-check-session-1"'*) ok "settings_get returns the remembered session id" ;;
+	*) bad "remembered session missing -> $(printf '%s' "$out" | cut1 200)" ;;
+esac
+
+out=$(rpc luci.hermes-agent session_remember '{"session_id":""}')
+case $out in
+	*'"ok":true'*) ok "remembered session can be cleared" ;;
+	*) bad "clearing remembered session -> $(printf '%s' "$out" | cut1 200)" ;;
+esac
+
 step "chat, browser path"
 out=$(rpc luci.hermes-agent chat_poll '{"tail":true}')
 case $out in

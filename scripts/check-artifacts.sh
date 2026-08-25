@@ -159,6 +159,9 @@ else
 			/usr/share/rpcd/acl.d/luci-app-hermes-agent.json \
 			/usr/share/rpcd/ucode/luci.hermes-agent \
 			/usr/sbin/hermes-chatd \
+			/usr/sbin/hermes-log-cache \
+			/usr/lib/lua/luci/i18n/hermes-agent.zh-cn.lmo \
+			/etc/uci-defaults/99-hermes-agent-i18n \
 			/etc/init.d/hermes-chatd
 
 		# The two scripts must be executable, or procd starts nothing.

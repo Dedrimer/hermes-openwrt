@@ -8,16 +8,17 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-hermes-agent
 PKG_VERSION:=0.20.5
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 
 # Version-tracked with the hermes-agent package it manages; PKG_RELEASE moves on
-# its own for packaging fixes (r2: the Settings page silently discarded API keys,
-# see docs/PORTING.md §7).
+# its own for packaging fixes and LuCI-only features (r2 fixed Settings API key
+# writes; r3 adds i18n, log caching and terminal session controls).
 
 PKG_LICENSE:=Apache-2.0
 PKG_MAINTAINER:=hermes-openwrt feed <https://github.com/hermes-openwrt>
 
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)
+PKG_BUILD_DEPENDS:=luci-base/host
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -47,6 +48,7 @@ define Build/Prepare
 endef
 
 define Build/Compile
+	po2lmo ./po/zh_Hans/hermes-agent.po $(PKG_BUILD_DIR)/hermes-agent.zh-cn.lmo
 endef
 
 define Package/luci-app-hermes-agent/install
@@ -62,11 +64,18 @@ define Package/luci-app-hermes-agent/install
 	$(INSTALL_DIR) $(1)/usr/share/rpcd/ucode
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/root/usr/share/rpcd/ucode/luci.hermes-agent \
 		$(1)/usr/share/rpcd/ucode/
+	$(INSTALL_DIR) $(1)/usr/lib/lua/luci/i18n
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/hermes-agent.zh-cn.lmo \
+		$(1)/usr/lib/lua/luci/i18n/
+	$(INSTALL_DIR) $(1)/etc/uci-defaults
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/root/etc/uci-defaults/99-hermes-agent-i18n \
+		$(1)/etc/uci-defaults/
 
 	# The chat bridge. Python 3 stdlib only -- it rides the interpreter that
 	# hermes-agent already depends on, so this adds no packages.
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/hermes-chatd $(1)/usr/sbin/hermes-chatd
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/hermes-log-cache $(1)/usr/sbin/hermes-log-cache
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/hermes-chatd.init $(1)/etc/init.d/hermes-chatd
 endef
@@ -81,6 +90,11 @@ define Package/luci-app-hermes-agent/postinst
 	rm -f /tmp/luci-indexcache.*
 	rm -rf /tmp/luci-modulecache/
 	/etc/init.d/rpcd reload 2>/dev/null
+	uci -q get luci.languages.zh_cn >/dev/null || { \
+		uci set luci.languages.zh_cn='简体中文 (Simplified Chinese)'; \
+		uci commit luci; \
+	}
+	/usr/sbin/hermes-log-cache >/dev/null 2>&1 &
 	/etc/init.d/hermes-chatd enable 2>/dev/null
 	/etc/init.d/hermes-chatd restart 2>/dev/null
 	exit 0

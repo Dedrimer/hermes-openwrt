@@ -31,6 +31,8 @@ for f in \
 	packages/hermes-agent/files/hermes-agent.init \
 	packages/hermes-agent/files/hermes-wrapper \
 	packages/luci-app-hermes-agent/files/hermes-chatd.init \
+	packages/luci-app-hermes-agent/files/hermes-log-cache \
+	packages/luci-app-hermes-agent/root/etc/uci-defaults/99-hermes-agent-i18n \
 	scripts/check-artifacts.sh \
 	scripts/check-sources.sh \
 	scripts/release-notes.sh \
@@ -86,6 +88,20 @@ do
 		sed 's/^/        /' "$tmp/err"
 	fi
 done
+
+echo "== translations"
+if command -v msgfmt >/dev/null 2>&1; then
+	for f in packages/luci-app-hermes-agent/po/*/*.po; do
+		if msgfmt --check --check-format -o /dev/null "$f" 2>"$tmp/err"; then
+			ok "$f"
+		else
+			bad "$f"
+			sed 's/^/        /' "$tmp/err"
+		fi
+	done
+else
+	skip "msgfmt not installed -- translations unchecked"
+fi
 
 # GitHub silently ignores a workflow it cannot parse: no run, no error, no hint
 # in the Actions tab. And a shell typo inside a `run:` block surfaces an hour

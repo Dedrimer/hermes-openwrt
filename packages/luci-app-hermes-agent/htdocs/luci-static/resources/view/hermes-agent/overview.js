@@ -33,12 +33,12 @@ const callAction = rpc.declare({
 const callLogs = rpc.declare({
 	object: 'luci.hermes-agent',
 	method: 'logs',
-	params: [ 'lines', 'pattern' ],
+	params: [ 'lines', 'pattern', 'refresh' ],
 	expect: {}
 });
 
 const LOG_LINES = 80;
-const LOG_INTERVAL = 15;
+const LOG_INTERVAL = 300;
 
 // Render a label/value pair as a table row. LuCI's own status pages use this
 // two-column table idiom, so it inherits the theme's spacing and dark mode.
@@ -95,7 +95,7 @@ return view.extend({
 			}
 
 			return this.refresh();
-		}).then(() => this.refreshLogs()).catch(err => {
+		}).then(() => this.refreshLogs(true)).catch(err => {
 			ui.addNotification(null, E('p', {}, [
 				_('Operation %s failed: %s').format(op, err.message)
 			]), 'error');
@@ -113,8 +113,16 @@ return view.extend({
 
 	// logread matches on the syslog tag, which covers both the init script's own
 	// messages and procd's capture of the gateway's stdout/stderr.
-	refreshLogs() {
-		return L.resolveDefault(callLogs(LOG_LINES, 'hermes'), null).then(res => {
+	refreshLogs(force) {
+		if (force && this.logRefreshButton)
+			this.logRefreshButton.disabled = true;
+
+		const request = callLogs(LOG_LINES, 'hermes', force === true);
+
+		return (force ? request : L.resolveDefault(request, null)).then(res => {
+			if (force && (!res || res.code != 0))
+				throw new Error(_('Unable to update the log cache.'));
+
 			if (!this.logNode)
 				return;
 
@@ -128,6 +136,17 @@ return view.extend({
 
 			if (atBottom)
 				this.logNode.scrollTop = this.logNode.scrollHeight;
+		}).finally(() => {
+			if (force && this.logRefreshButton)
+				this.logRefreshButton.disabled = false;
+		});
+	},
+
+	handleRefreshLogs(ev) {
+		return this.refreshLogs(true).catch(err => {
+			ui.addNotification(null, E('p', {}, [
+				_('Failed to refresh the log: %s').format(err.message)
+			]), 'error');
 		});
 	},
 
@@ -207,10 +226,15 @@ return view.extend({
 				'border-radius:3px;background:rgba(128,128,128,.04)'
 		}, [ E('em', {}, [ _('Loading…') ]) ]);
 
-		// poll.add only fires after the first interval elapses, and 15s of
+		// poll.add only fires after the first interval elapses, and 5 minutes of
 		// "Loading…" reads as broken. Fill it in now; the node is still detached
 		// at this point, which dom.content does not mind.
-		this.refreshLogs();
+		this.refreshLogs(false);
+
+		this.logRefreshButton = E('button', {
+			'class': 'cbi-button cbi-button-action',
+			'click': ui.createHandlerFn(this, 'handleRefreshLogs')
+		}, [ _('Refresh now') ]);
 
 		return E([], [
 			E('h2', {}, [ _('Hermes Agent') ]),
@@ -229,7 +253,13 @@ return view.extend({
 					: btn(_('Enable on boot'), 'enable', 'apply')
 			]),
 
-			E('h3', { 'style': 'margin-top:1.2em' }, [ _('Recent log') ]),
+			E('div', {
+				'style': 'display:flex;align-items:center;justify-content:space-between;' +
+					'gap:.6em;margin-top:1.2em'
+			}, [
+				E('h3', { 'style': 'margin:0' }, [ _('Recent log') ]),
+				this.logRefreshButton
+			]),
 			this.logNode
 		]);
 	}

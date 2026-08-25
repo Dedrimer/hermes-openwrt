@@ -1,0 +1,28 @@
+#!/bin/sh
+# Refresh the LuCI log snapshot atomically. The lock prevents several browser
+# tabs from starting the relatively slow logread query at the same time.
+
+CACHE=/tmp/hermes-agent.log-cache
+LOCK=/tmp/hermes-agent.log-cache.lock
+TMP=/tmp/hermes-agent.log-cache.$$
+
+if ! mkdir "$LOCK" 2>/dev/null; then
+	[ "$1" = '--wait' ] || exit 0
+
+	n=0
+	while [ -d "$LOCK" ] && [ "$n" -lt 60 ]; do
+		sleep 1
+		n=$((n + 1))
+	done
+
+	mkdir "$LOCK" 2>/dev/null || exit 1
+fi
+trap 'rm -f "$TMP"; rmdir "$LOCK"' EXIT INT TERM
+
+if logread -l 1000 -e hermes > "$TMP" 2>/dev/null; then
+	chmod 0600 "$TMP"
+	mv "$TMP" "$CACHE"
+	exit 0
+fi
+
+exit 1

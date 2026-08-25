@@ -408,7 +408,7 @@ Actions → **release** → Run workflow。没有任何 push 会触发它——�
 
 | 输入 | 默认 | 说明 |
 | --- | --- | --- |
-| `tag` | `v<PKG_VERSION>-r<PKG_RELEASE>` | 从两个 Makefile 读；版本必须一致，`PKG_RELEASE` 取较大的那个（现在是 `v0.20.5-r2`）。tag 或同名 release 已存在就直接失败，不覆盖已经有人下载过的产物 |
+| `tag` | `v<PKG_VERSION>-r<PKG_RELEASE>` | 从两个 Makefile 读；版本必须一致，`PKG_RELEASE` 取较大的那个（现在是 `v0.20.5-r3`）。tag 或同名 release 已存在就直接失败，不覆盖已经有人下载过的产物 |
 | `highlights` | 空 | 一段 Markdown，放在 release 说明最上面 |
 
 顺序是 `prepare`（解析并占住 tag）→ `lint` → `build` 四条腿 → `release`。
@@ -421,7 +421,7 @@ tag 的合法性和重名在**花掉一小时构建之前**就检查完；`relea
 
 ```
 hermes-agent_0.20.5-r1_openwrt-25.12_x86_64.apk
-luci-app-hermes-agent_0.20.5-r2_openwrt-24.10_aarch64_generic.ipk
+luci-app-hermes-agent_0.20.5-r3_openwrt-24.10_aarch64_generic.ipk
 ```
 
 因为 apk 的文件名是 `<包>-<版本>-r<rel>.apk`，**里面根本不带架构**——两条 25.12 的腿

@@ -1,0 +1,353 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: luci-app-hermes-agent\n"
+"Language: zh_Hans\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+msgid "%d tokens"
+msgstr "%d 个令牌"
+
+msgid "%s free of %s (%s used)"
+msgstr "%s 可用，共 %s（已使用 %s）"
+
+msgid "%s timed out"
+msgstr "%s 超时"
+
+msgid "(PID %d)"
+msgstr "（PID %d）"
+
+msgid "A key is currently configured."
+msgstr "当前已配置密钥。"
+
+msgid "Abort"
+msgstr "中止"
+
+msgid "Allow"
+msgstr "允许"
+
+msgid "Allow for this session"
+msgstr "本会话内允许"
+
+msgid "Allow once"
+msgstr "仅允许一次"
+
+msgid "Always allow"
+msgstr "始终允许"
+
+msgid "Answer"
+msgstr "回答"
+
+msgid "Anthropic API key"
+msgstr "Anthropic API 密钥"
+
+msgid "Approval required"
+msgstr "需要批准"
+
+msgid "Chat"
+msgstr "对话"
+
+msgid "Chat bridge"
+msgstr "对话桥接"
+
+msgid "Check that the service is started on the Overview page. The bridge reconnects on its own once the gateway is up."
+msgstr "请在概览页面确认服务已启动。网关启动后，桥接服务会自动重新连接。"
+
+msgid "Connected"
+msgstr "已连接"
+
+msgid "Data directory"
+msgstr "数据目录"
+
+msgid "Debug"
+msgstr "调试"
+
+msgid "DeepSeek API key"
+msgstr "DeepSeek API 密钥"
+
+msgid "Deny"
+msgstr "拒绝"
+
+msgid "Disable on boot"
+msgstr "取消开机启动"
+
+msgid "Disabled"
+msgstr "已禁用"
+
+msgid "Enable on boot"
+msgstr "启用开机启动"
+
+msgid "Enabled"
+msgstr "已启用"
+
+msgid "End session"
+msgstr "结束会话"
+
+msgid "Enter a task for Hermes. Ctrl+Enter sends."
+msgstr "输入要交给 Hermes 的任务。按 Ctrl+Enter 执行。"
+
+msgid "Error"
+msgstr "错误"
+
+msgid "Failed to refresh the log: %s"
+msgstr "刷新日志失败：%s"
+
+msgid "Failed to save Hermes settings: %s"
+msgstr "保存 Hermes 设置失败：%s"
+
+msgid "Free space"
+msgstr "可用空间"
+
+msgid "Gateway address"
+msgstr "网关地址"
+
+msgid "Gateway service"
+msgstr "网关服务"
+
+msgid "Google Gemini API key"
+msgstr "Google Gemini API 密钥"
+
+msgid "Hermes"
+msgstr "Hermes"
+
+msgid "Hermes Agent"
+msgstr "Hermes Agent"
+
+msgid "Hermes Agent Settings"
+msgstr "Hermes Agent 设置"
+
+msgid "Hermes Terminal"
+msgstr "Hermes 终端"
+
+msgid "Hermes configuration"
+msgstr "Hermes 配置"
+
+msgid "Hermes has not been initialised yet — %s is missing. Reinstall the hermes-agent package to recreate it."
+msgstr "Hermes 尚未初始化，缺少 %s。请重新安装 hermes-agent 软件包以重新创建。"
+
+msgid "Hermes needs a clarification"
+msgstr "Hermes 需要进一步确认"
+
+msgid "Hermes runs as a local gateway; this page manages the service, and the Chat page talks to it."
+msgstr "Hermes 以本地网关形式运行；本页面用于管理服务，对话页面通过该网关与 Hermes 通信。"
+
+msgid "Info"
+msgstr "信息"
+
+msgid "Interrupt"
+msgstr "中断"
+
+msgid "Interrupting…"
+msgstr "正在中断…"
+
+msgid "Keep this on loopback. Hermes requires an authentication provider for any non-loopback bind, and the LuCI chat page reaches the gateway locally regardless."
+msgstr "请保持使用回环地址。绑定到非回环地址时 Hermes 需要身份验证提供程序，而 LuCI 对话页面始终通过本机访问网关。"
+
+msgid "Listen address"
+msgstr "监听地址"
+
+msgid "Loading history…"
+msgstr "正在加载历史记录…"
+
+msgid "Loading…"
+msgstr "正在加载…"
+
+msgid "Log level"
+msgstr "日志级别"
+
+msgid "No log entries yet."
+msgstr "暂无日志。"
+
+msgid "No session has been saved yet."
+msgstr "尚未保存会话。"
+
+msgid "Not configured."
+msgstr "未配置。"
+
+msgid "Not running"
+msgstr "未运行"
+
+msgid "Nous Research API key"
+msgstr "Nous Research API 密钥"
+
+msgid "OpenAI API key"
+msgstr "OpenAI API 密钥"
+
+msgid "OpenAI base URL"
+msgstr "OpenAI 基础 URL"
+
+msgid "OpenRouter API key"
+msgstr "OpenRouter API 密钥"
+
+msgid "Operation %s failed (exit code %d)."
+msgstr "操作 %s 失败（退出码 %d）。"
+
+msgid "Operation %s failed: %s"
+msgstr "操作 %s 失败：%s"
+
+msgid "Optional. Point this at an OpenAI-compatible endpoint to use a local or third-party model server."
+msgstr "可选。将其指向兼容 OpenAI 的端点，以使用本地或第三方模型服务器。"
+
+msgid "Overview"
+msgstr "概览"
+
+msgid "Please clarify"
+msgstr "请进一步说明"
+
+msgid "Port"
+msgstr "端口"
+
+msgid "Preparing %s…"
+msgstr "正在准备 %s…"
+
+msgid "Provider credentials"
+msgstr "提供商凭据"
+
+msgid "Reasoning"
+msgstr "推理"
+
+msgid "Recent log"
+msgstr "最近日志"
+
+msgid "Reconnecting"
+msgstr "正在重新连接"
+
+msgid "Refresh now"
+msgstr "立即刷新"
+
+msgid "Remember chat session"
+msgstr "记住对话会话"
+
+msgid "Remembered session ID"
+msgstr "已记住的会话 ID"
+
+msgid "Remove this key"
+msgstr "删除此密钥"
+
+msgid "Restart"
+msgstr "重启"
+
+msgid "Restore the most recent Hermes session and its history when the terminal is opened again."
+msgstr "再次打开终端时恢复最近的 Hermes 会话及其历史记录。"
+
+msgid "Run"
+msgstr "执行"
+
+msgid "Running"
+msgstr "运行中"
+
+msgid "Running %s…"
+msgstr "正在运行 %s…"
+
+msgid "Sending answer…"
+msgstr "正在发送回答…"
+
+msgid "Sending decision…"
+msgstr "正在发送决定…"
+
+msgid "Sending…"
+msgstr "正在发送…"
+
+msgid "Settings"
+msgstr "设置"
+
+msgid "Start"
+msgstr "开始"
+
+msgid "Start on boot"
+msgstr "开机启动"
+
+msgid "Starting Hermes…"
+msgstr "正在启动 Hermes…"
+
+msgid "Status"
+msgstr "状态"
+
+msgid "Stop"
+msgstr "停止"
+
+msgid "Stopped"
+msgstr "已停止"
+
+msgid "Stored in %s with mode 0600, not in UCI. Existing keys are never displayed — leave a field blank to keep it unchanged."
+msgstr "存储在 %s 中，权限为 0600，而非存储在 UCI 中。现有密钥不会显示；将字段留空即可保持不变。"
+
+msgid "System"
+msgstr "系统"
+
+msgid "The chat bridge (hermes-chatd) is not running, so the Chat page will not work."
+msgstr "对话桥接服务（hermes-chatd）未运行，因此对话页面无法使用。"
+
+msgid "The chat bridge is not connected to the gateway."
+msgstr "对话桥接服务未连接到网关。"
+
+msgid "The chat bridge is not running."
+msgstr "对话桥接服务未运行。"
+
+msgid "The chat bridge is running but not connected to the gateway%s. The Chat page will not work until it is."
+msgstr "对话桥接服务正在运行，但尚未连接到网关%s。连接成功前对话页面无法使用。"
+
+msgid "The contents of %s. Hermes owns this file and rewrites it itself, so what you enter may come back reformatted. A backup is kept as %s on every save."
+msgstr "这里显示 %s 的内容。该文件由 Hermes 管理并可能自行重写，因此输入内容可能被重新格式化。每次保存时都会在 %s 保留备份。"
+
+msgid "The gateway is bound to %s rather than loopback. Hermes then requires an authentication provider, and the port becomes reachable from your network — the LuCI chat page does not need this."
+msgstr "网关绑定到了 %s 而不是回环地址。此时 Hermes 需要身份验证提供程序，并且该端口可从网络访问；LuCI 对话页面不需要这样设置。"
+
+msgid "Tool"
+msgstr "工具"
+
+msgid "Unable to update the log cache."
+msgstr "无法更新日志缓存。"
+
+msgid "Version"
+msgstr "版本"
+
+msgid "Warning"
+msgstr "警告"
+
+msgid "Where the agent reads and writes files when a task involves them."
+msgstr "任务涉及文件时，Agent 在此目录中读取和写入文件。"
+
+msgid "Workspace"
+msgstr "工作区"
+
+msgid "Workspace directory"
+msgstr "工作区目录"
+
+msgid "You"
+msgstr "你"
+
+msgid "a tool"
+msgstr "工具"
+
+msgid "or type your own answer"
+msgstr "或输入自定义回答"
+
+msgid "session %s"
+msgstr "会话 %s"
+
+msgid "the backend rejected the change"
+msgstr "后端拒绝了此更改"
+
+msgid "the bridge refused the request"
+msgstr "桥接服务拒绝了请求"
+
+msgid "the gateway did not return a session id"
+msgstr "网关未返回会话 ID"
+
+msgid "the gateway returned an error"
+msgstr "网关返回错误"
+
+msgid "tool"
+msgstr "工具"
+
+msgid "unavailable"
+msgstr "不可用"
+
+msgid "unknown"
+msgstr "未知"
+
+msgid "unknown error"
+msgstr "未知错误"

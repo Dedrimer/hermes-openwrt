@@ -113,6 +113,7 @@ esac
 
 step "files landed"
 for f in /usr/bin/hermes /usr/bin/hermes-agent /usr/sbin/hermes-chatd \
+	/usr/sbin/hermes-log-cache \
 	/etc/init.d/hermes-agent /etc/init.d/hermes-chatd \
 	/etc/config/hermes-agent /srv/hermes/config.yaml /srv/hermes/.env \
 	/usr/share/rpcd/ucode/luci.hermes-agent \
@@ -376,6 +377,36 @@ B=2"}}' 2>&1)
 		|| bad "env_clear dropped CUSTOM_KEEP_ME=1"
 else
 	bad "settings_set not tested: the ubus object is missing"
+fi
+
+step "remembered LuCI chat session"
+if ubus list 2>/dev/null | grep -qx 'luci.hermes-agent'; then
+	out=$(ubus call luci.hermes-agent session_remember \
+		'{"session_id":"smoke-session-1"}' 2>&1)
+	if echo "$out" | grep -q '"ok": *true' && \
+		grep -qx 'smoke-session-1' /srv/hermes/.luci-session 2>/dev/null
+	then
+		ok "session_remember persisted the session id"
+	else
+		bad "session_remember: $(echo "$out" | tr -s '\n\t ' ' ' | cut -c1-160)"
+	fi
+
+	mode=$(ls -l /srv/hermes/.luci-session 2>/dev/null | awk '{print $1}')
+	[ "$mode" = '-rw-------' ] \
+		&& ok "remembered session file is $mode" \
+		|| bad "remembered session file mode is ${mode:-missing}, expected -rw-------"
+
+	out=$(ubus call luci.hermes-agent settings_get 2>&1)
+	echo "$out" | grep -q '"remembered_session": *"smoke-session-1"' \
+		&& ok "settings_get reports the remembered session id" \
+		|| bad "settings_get omitted the remembered session: $(echo "$out" | tr -s '\n\t ' ' ' | cut -c1-180)"
+
+	ubus call luci.hermes-agent session_remember '{"session_id":""}' >/dev/null 2>&1
+	[ ! -e /srv/hermes/.luci-session ] \
+		&& ok "clearing the remembered session removes its file" \
+		|| bad "clearing the remembered session left its file behind"
+else
+	bad "session_remember not tested: the ubus object is missing"
 fi
 
 step "init scripts parse"

@@ -38,6 +38,13 @@ const callChatPoll = rpc.declare({
 	expect: {}
 });
 
+const callSessionRemember = rpc.declare({
+	object: 'luci.hermes-agent',
+	method: 'session_remember',
+	params: [ 'session_id' ],
+	expect: {}
+});
+
 const POLL_INTERVAL = 1;
 const BOOST_MS = 350;
 const BOOST_TRIES = 8;
@@ -57,12 +64,12 @@ const CHOICE_LABELS = {
 };
 
 const ROLE_STYLE = {
-	'user': 'background:rgba(33,150,243,.10);border-left:3px solid #2196f3',
-	'assistant': 'background:rgba(76,175,80,.08);border-left:3px solid #4caf50',
-	'system': 'background:rgba(158,158,158,.10);border-left:3px solid #9e9e9e',
-	'tool': 'background:rgba(158,158,158,.07);border-left:3px solid #bdbdbd',
-	'error': 'background:rgba(244,67,54,.10);border-left:3px solid #f44336',
-	'think': 'background:rgba(156,39,176,.07);border-left:3px solid #9c27b0'
+	'user': 'border-left:3px solid #55c271',
+	'assistant': 'border-left:3px solid #69a7e3',
+	'system': 'border-left:3px solid #8b949e;color:#aab2bd',
+	'tool': 'border-left:3px solid #d5a94e;color:#d6d6d6',
+	'error': 'border-left:3px solid #e26464;color:#ffb4b4',
+	'think': 'border-left:3px solid #b58bd8;color:#c9c9c9'
 };
 
 const ROLE_LABEL = {
@@ -115,6 +122,8 @@ return view.extend({
 	polling: false,
 	boosts: 0,
 	primed: false,
+	starting: false,
+	linkDown: true,
 
 	// --- transcript state --------------------------------------------------
 	cur: null,        // open assistant bubble
@@ -219,8 +228,6 @@ return view.extend({
 				for (let i = 0; i < lines.length; i++)
 					this.dispatch(lines[i]);
 
-				if (res.active_session && !this.sid)
-					this.sid = res.active_session;
 			})
 			.then(() => this.expire())
 			.finally(() => { this.polling = false; });
@@ -285,7 +292,7 @@ return view.extend({
 		// Session scoping: the bridge is shared, and a scheduled task or a CLI
 		// client can be running a turn on another session at the same time.
 		// Anything session-bound that is not ours is not ours to render.
-		if (sid && this.sid && sid != this.sid && type != 'bridge.status')
+		if (sid && (!this.sid || sid != this.sid) && type != 'bridge.status')
 			return;
 
 		switch (type) {
@@ -522,11 +529,17 @@ return view.extend({
 
 		this.busy = busy;
 
+		if (this.input)
+			this.input.disabled = busy || !this.sid;
+
 		if (this.btnSend)
-			this.btnSend.disabled = busy;
+			this.btnSend.disabled = busy || !this.sid || this.linkDown;
 
 		if (this.btnStop)
 			this.btnStop.style.display = busy ? '' : 'none';
+
+		if (this.btnEnd)
+			this.btnEnd.disabled = busy;
 
 		if (busy)
 			this.boost();
@@ -534,6 +547,7 @@ return view.extend({
 
 	setLink(res) {
 		const down = (res.running !== true) || (res.connected !== true);
+		this.linkDown = down;
 		const msg = res.error || (res.running !== true
 			? _('The chat bridge is not running.')
 			: _('The chat bridge is not connected to the gateway.'));
@@ -547,10 +561,11 @@ return view.extend({
 				: []);
 		}
 
-		if (this.btnSend && down)
-			this.btnSend.disabled = true;
-		else if (this.btnSend && !this.busy)
-			this.btnSend.disabled = false;
+		if (this.btnSend)
+			this.btnSend.disabled = down || this.busy || !this.sid;
+
+		if (this.btnStart)
+			this.btnStart.disabled = down || this.starting;
 	},
 
 	renderMeta() {
@@ -746,14 +761,11 @@ return view.extend({
 	handleSend(ev) {
 		const text = (this.input.value ?? '').trim();
 
-		if (text == '')
+		if (text == '' || this.busy)
 			return Promise.resolve();
 
-		if (!this.sid) {
-			return this.startSession()
-				.then(() => this.handleSend(ev))
-				.catch(err => this.fail(err));
-		}
+		if (!this.sid)
+			return Promise.resolve();
 
 		this.input.value = '';
 		this.row('user', text);
@@ -773,7 +785,10 @@ return view.extend({
 			.catch(err => this.fail(err));
 	},
 
-	handleNew(ev) {
+	handleEnd(ev) {
+		if (this.busy || this.starting)
+			return Promise.resolve();
+
 		const old = this.sid;
 
 		this.sid = '';
@@ -783,15 +798,56 @@ return view.extend({
 
 		return (old ? this.send('session.close', { session_id: old })
 			.catch(() => null) : Promise.resolve())
-			.then(() => this.startSession())
+			.then(() => L.resolveDefault(callSessionRemember(''), {}))
 			.then(() => {
 				dom.content(this.log, []);
 				this.cur = null;
 				this.curThink = null;
 				this.tools = {};
 				this.setActivity('');
+				this.renderMeta();
+				this.updateSessionControls();
 			})
 			.catch(err => this.fail(err));
+	},
+
+	handleStart(ev) {
+		if (this.starting || this.sid)
+			return Promise.resolve();
+
+		this.starting = true;
+		this.updateSessionControls();
+		dom.content(this.log, []);
+		this.row('system', '$ hermes');
+		this.setActivity(_('Starting Hermes…'));
+
+		return this.startSession()
+			.catch(err => this.fail(err))
+			.finally(() => {
+				this.starting = false;
+				this.setActivity('');
+				this.updateSessionControls();
+			});
+	},
+
+	updateSessionControls() {
+		const started = !!this.sid;
+
+		if (this.input)
+			this.input.disabled = !started || this.busy;
+
+		if (this.btnSend)
+			this.btnSend.disabled = !started || this.busy || this.linkDown;
+
+		if (this.btnStart) {
+			this.btnStart.style.display = started ? 'none' : '';
+			this.btnStart.disabled = this.starting || this.linkDown;
+		}
+
+		if (this.btnEnd) {
+			this.btnEnd.style.display = started ? '' : 'none';
+			this.btnEnd.disabled = this.busy;
+		}
 	},
 
 	// close_on_disconnect stays false on purpose: hermes-chatd reconnects after
@@ -816,7 +872,10 @@ return view.extend({
 			if (res.messages && res.messages.length)
 				this.loadHistory(res);
 
-			return this.sid;
+			return L.resolveDefault(callSessionRemember(this.sid), {}).then(() => {
+				this.updateSessionControls();
+				return this.sid;
+			});
 		});
 	},
 
@@ -827,22 +886,23 @@ return view.extend({
 		this.tools = {};
 		this.gen = st.gen ?? 0;
 		this.offset = st.offset ?? 0;
-		this.sid = st.active_session ?? '';
+		this.sid = st.remember_session === true ? (st.remembered_session ?? '') : '';
 
 		this.banner = E('div', {});
 		this.meta = E('div', { 'style': 'font-size:90%;opacity:.7;margin-bottom:.3em' }, []);
 		this.log = E('div', {
 			'style': 'height:26em;overflow-y:auto;padding:.3em;border:1px solid rgba(128,128,128,.35);' +
-				'border-radius:3px;background:rgba(128,128,128,.04)'
+				'border-radius:3px;background:#111820;color:#d8dee9;font-family:monospace'
 		}, []);
 		this.activity = E('div', { 'style': 'min-height:1.3em;font-size:90%;opacity:.7;margin:.2em 0' }, []);
 		this.prompt = E('div', {}, []);
 
 		this.input = E('textarea', {
 			'class': 'cbi-input-textarea',
-			'style': 'width:100%;font-family:inherit',
+			'style': 'width:100%;font-family:monospace;background:#111820;color:#d8dee9',
 			'rows': 3,
-			'placeholder': _('Ask Hermes something. Ctrl+Enter sends.')
+			'disabled': !this.sid,
+			'placeholder': _('Enter a task for Hermes. Ctrl+Enter sends.')
 		});
 
 		// Not ui.createHandlerFn here: that disables the element it fires on for
@@ -857,8 +917,10 @@ return view.extend({
 
 		this.btnSend = E('button', {
 			'class': 'cbi-button cbi-button-positive',
+			'style': 'margin-left:.4em',
+			'disabled': !this.sid,
 			'click': ui.createHandlerFn(this, 'handleSend')
-		}, [ _('Send') ]);
+		}, [ _('Run') ]);
 
 		this.btnStop = E('button', {
 			'class': 'cbi-button cbi-button-negative',
@@ -866,14 +928,20 @@ return view.extend({
 			'click': ui.createHandlerFn(this, 'handleStop')
 		}, [ _('Interrupt') ]);
 
-		const btnNew = E('button', {
+		this.btnStart = E('button', {
+			'class': 'cbi-button cbi-button-positive',
+			'style': this.sid ? 'display:none' : '',
+			'click': ui.createHandlerFn(this, 'handleStart')
+		}, [ _('Start') ]);
+
+		this.btnEnd = E('button', {
 			'class': 'cbi-button cbi-button-action',
-			'style': 'margin-left:.4em',
-			'click': ui.createHandlerFn(this, 'handleNew')
-		}, [ _('New session') ]);
+			'style': (this.sid ? '' : 'display:none') + ';margin-left:.4em',
+			'click': ui.createHandlerFn(this, 'handleEnd')
+		}, [ _('End session') ]);
 
 		const body = E([], [
-			E('h2', {}, [ _('Hermes Chat') ]),
+			E('h2', {}, [ _('Hermes Terminal') ]),
 			this.banner,
 			E('div', { 'class': 'cbi-section' }, [
 				this.meta,
@@ -881,23 +949,31 @@ return view.extend({
 				this.activity,
 				this.prompt,
 				this.input,
-				E('div', { 'style': 'margin-top:.4em' }, [ this.btnSend, this.btnStop, btnNew ])
+				E('div', { 'style': 'margin-top:.4em' }, [
+					this.btnStart, this.btnSend, this.btnStop, this.btnEnd
+				])
 			])
 		]);
 
 		this.setLink(st);
 
-		// Attach to whatever session the bridge already had (a reload, or a turn
-		// started from the CLI), otherwise open one. Either way the first poll
-		// after this picks the stream up from the offset load() established.
+		// A remembered session only loads history; it does not start a new Hermes
+		// process or submit work. With no remembered id the explicit Start button
+		// is the sole session creation path, preventing repeated page loads from
+		// creating sessions on a small router.
 		const boot = (st.running === true && st.connected === true)
-			? (this.sid
-				? this.send('session.history', { session_id: this.sid })
-					.then(res => this.loadHistory(res))
-				: this.startSession())
+			? (this.sid ? this.send('session.history', { session_id: this.sid })
+				.then(res => this.loadHistory(res)) : Promise.resolve())
 			: Promise.resolve();
+		const forget = st.remember_session === true
+			? Promise.resolve()
+			: L.resolveDefault(callSessionRemember(''), {});
 
-		boot.catch(err => this.fail(err)).then(() => {
+		Promise.all([ boot, forget ]).catch(err => {
+			this.sid = '';
+			this.updateSessionControls();
+			return L.resolveDefault(callSessionRemember(''), {}).then(() => this.fail(err));
+		}).then(() => {
 			this.primed = true;
 			poll.add(L.bind(this.pump, this), POLL_INTERVAL);
 		});
